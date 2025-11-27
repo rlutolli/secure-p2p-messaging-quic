@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/mdns"
@@ -99,6 +100,16 @@ func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
 				continue
 			}
 
+			// Validate this is actually a P2P messenger service
+			if !ds.validateService(entry) {
+				continue
+			}
+
+			// Filter out common non-P2P ports
+			if ds.isCommonServicePort(entry.Port) {
+				continue
+			}
+
 			// Determine IP to use
 			var ip net.IP
 			if entry.AddrV4 != nil {
@@ -123,6 +134,45 @@ func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
 			return peers, ctx.Err()
 		}
 	}
+}
+
+// validateService checks if the service entry has the expected TXT records
+func (ds *DiscoveryService) validateService(entry *mdns.ServiceEntry) bool {
+	// Check if it has TXT records with our expected format
+	hasRoom := false
+	hasVersion := false
+
+	for _, txt := range entry.InfoFields {
+		if strings.HasPrefix(txt, "room=") {
+			hasRoom = true
+			// Verify it's the same room
+			room := strings.TrimPrefix(txt, "room=")
+			if room != ds.roomName {
+				return false // Different room
+			}
+		}
+		if strings.HasPrefix(txt, "version=") {
+			hasVersion = true
+		}
+	}
+
+	// Must have both room and version to be valid
+	return hasRoom && hasVersion
+}
+
+// isCommonServicePort should filter out ports commonly used by other services
+func (ds *DiscoveryService) isCommonServicePort(port int) bool {
+	commonPorts := map[int]bool{
+		53:   true, // DNS
+		5353: true, // mDNS
+		5355: true, // LLMNR
+		1900: true, // SSDP
+		3702: true, // WS-Discovery
+		7000: true, // Common service port
+		8000: true, // Common HTTP
+		8080: true, // Common HTTP
+	}
+	return commonPorts[port]
 }
 
 func (ds *DiscoveryService) isSelf(ip net.IP, port int) bool {

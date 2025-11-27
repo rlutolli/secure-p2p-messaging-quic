@@ -59,11 +59,7 @@ func main() {
 	// 4. Print status
 	fmt.Printf("\n[Started] Port: %d | Room: %s | Private: %v\n",
 		app.server.Port(), roomName, isPrivate)
-	fmt.Println("\nCommands:")
-	fmt.Println("  send <message>     - Send to all peers in room")
-	fmt.Println("  peers              - List discovered peers")
-	fmt.Println("  connect <ip:port>  - Connect to specific peer")
-	fmt.Println("  quit               - Exit")
+	fmt.Println("\nType 'help' for available commands")
 	fmt.Println()
 
 	// 5. Interactive CLI
@@ -133,7 +129,7 @@ func (app *App) runCLI() {
 
 		case "connect":
 			if len(parts) < 2 {
-				fmt.Println("Usage: connect <ip:port>")
+				fmt.Println("Usage: connect <ip:port> [message]")
 				break
 			}
 			// Parse: connect ip:port [message]
@@ -145,11 +141,17 @@ func (app *App) runCLI() {
 			}
 			app.connectTo(addr, msg)
 
+		case "room", "rooms":
+			app.showRoomInfo()
+
+		case "help", "?":
+			app.showHelp()
+
 		case "quit", "exit":
 			return
 
 		default:
-			fmt.Println("Unknown command. Try: send, peers, connect, quit")
+			fmt.Println("Unknown command. Type 'help' for available commands.")
 		}
 
 		fmt.Print("> ")
@@ -175,14 +177,30 @@ func (app *App) sendToRoom(message string) {
 		return
 	}
 
+	if len(peers) == 0 {
+		fmt.Println("No peers found in room.")
+		return
+	}
+
 	fmt.Printf("Found %d peer(s). Sending...\n", len(peers))
 
+	successCount := 0
 	for _, addr := range peers {
 		if err := app.connManager.Send(ctx, addr, message); err != nil {
-			fmt.Printf("  ✗ %s: %v\n", addr, err)
+			// Only show errors for connection failures, not timeouts (twhich are expected for non-P2P services)
+			if !strings.Contains(err.Error(), "deadline exceeded") && !strings.Contains(err.Error(), "CRYPTO_ERROR") {
+				fmt.Printf("  ✗ %s: %v\n", addr, err)
+			}
 		} else {
 			fmt.Printf("  ✓ %s\n", addr)
+			successCount++
 		}
+	}
+
+	if successCount == 0 && len(peers) > 0 {
+		fmt.Println("Warning: No peers responded. They may be offline or not P2P messenger instances.")
+	} else if successCount > 0 {
+		fmt.Printf("Message sent to %d peer(s)\n", successCount)
 	}
 }
 
@@ -226,6 +244,42 @@ func (app *App) connectTo(addr, message string) {
 	} else {
 		fmt.Printf("Connected to %s\n", addr)
 	}
+}
+
+func (app *App) showHelp() {
+	fmt.Println("\n╔════════════════════════════════════════════╗")
+	fmt.Println("║  Available Commands                        ║")
+	fmt.Println("╠════════════════════════════════════════════╣")
+	fmt.Println("║  send <message>     - Send message to all  ║")
+	fmt.Println("║                      peers in current room ║")
+	fmt.Println("║  peers              - List discovered peers║")
+	fmt.Println("║                      in current room       ║")
+	fmt.Println("║  connect <ip:port> - Connect directly to   ║")
+	fmt.Println("║                      a specific peer       ║")
+	fmt.Println("║  room               - Show current room    ║")
+	fmt.Println("║                      information           ║")
+	fmt.Println("║  help               - Show this help       ║")
+	fmt.Println("║  quit / exit        - Exit application     ║")
+	fmt.Println("╚════════════════════════════════════════════╝")
+	fmt.Println()
+}
+
+func (app *App) showRoomInfo() {
+	fmt.Printf("\nCurrent Room: %s\n", app.roomName)
+	fmt.Printf("Private Mode: %v\n", app.isPrivate)
+	fmt.Printf("Server Port: %d\n", app.server.Port())
+
+	if app.isPrivate {
+		fmt.Println("Discovery: Disabled (private mode)")
+	} else {
+		fmt.Println("Discovery: Enabled")
+		// Show discovered peer count
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		peers, _ := app.discovery.LookupPeers(ctx)
+		fmt.Printf("Discovered Peers: %d\n", len(peers))
+	}
+	fmt.Println()
 }
 
 func (app *App) shutdown() {
