@@ -160,8 +160,8 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 			if peer.room != nil {
 				// Broadcast to other peers (relay for mesh network)
 				s.broadcastToRoom(peer.room, peer.addr, content)
-				// Display locally
-				if s.onMessage != nil {
+				// Display locally (only if not already seen - prevents duplicates in mesh)
+				if s.onMessage != nil && s.connManager != nil && !s.connManager.IsDuplicate(senderAlias, content) {
 					s.onMessage(senderAlias, peer.room.name, content)
 				}
 			}
@@ -173,7 +173,8 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 		content := strings.TrimPrefix(message, "MSG:")
 		if peer.room != nil {
 			s.broadcastToRoom(peer.room, peer.addr, content)
-			if s.onMessage != nil {
+			// Display locally (only if not already seen - prevents duplicates in mesh)
+			if s.onMessage != nil && s.connManager != nil && !s.connManager.IsDuplicate(peer.alias, content) {
 				s.onMessage(peer.alias, peer.room.name, content)
 			}
 		}
@@ -183,7 +184,8 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 	// Default: treat as message if already in room
 	if peer.room != nil {
 		s.broadcastToRoom(peer.room, peer.addr, message)
-		if s.onMessage != nil {
+		// Display locally (only if not already seen - prevents duplicates in mesh)
+		if s.onMessage != nil && s.connManager != nil && !s.connManager.IsDuplicate(peer.alias, message) {
 			s.onMessage(peer.alias, peer.room.name, message)
 		}
 	}
@@ -210,8 +212,8 @@ func (s *Server) joinRoom(peer *Peer, roomName string) {
 	joinMsg := fmt.Sprintf("%s (%s) joined the chat", peer.alias, peer.addr)
 	s.broadcastToRoom(room, "", joinMsg)
 
-	// Display join message locally (so room creator sees it)
-	if s.onSystemMessage != nil {
+	// Display join message locally (so room creator sees it, check for duplicates)
+	if s.onSystemMessage != nil && s.connManager != nil && !s.connManager.IsDuplicate("System", joinMsg) {
 		s.onSystemMessage(joinMsg)
 	}
 
@@ -267,8 +269,8 @@ func (s *Server) removePeer(peer *Peer) {
 		leaveMsg := fmt.Sprintf("%s (%s) left the chat", peer.alias, peer.addr)
 		s.broadcastToRoom(peer.room, "", leaveMsg)
 
-		// Display leave message locally
-		if s.onSystemMessage != nil {
+		// Display leave message locally (check for duplicates)
+		if s.onSystemMessage != nil && s.connManager != nil && !s.connManager.IsDuplicate("System", leaveMsg) {
 			s.onSystemMessage(leaveMsg)
 		}
 
