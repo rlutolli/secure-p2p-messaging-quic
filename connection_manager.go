@@ -34,7 +34,7 @@ type ConnectionManager struct {
 	localPort   int
 	roomName    string
 	localAlias  string // Our alias for this session
-	
+
 	// Message deduplication
 	seenMsgsMu sync.Mutex
 	seenMsgs   map[string]time.Time // hash -> timestamp (for cleanup)
@@ -56,26 +56,26 @@ func NewConnectionManager(localPort int, roomName string) *ConnectionManager {
 		localAlias:  generateLocalAlias(),
 		seenMsgs:    make(map[string]time.Time),
 	}
-	
+
 	// Start cleanup goroutine for old message hashes
 	go cm.cleanupSeenMsgs()
-	
+
 	return cm
 }
 
-// isDuplicate checks if we've seen this message recently
-func (cm *ConnectionManager) isDuplicate(sender, message string) bool {
+// IsDuplicate checks if we've seen this message recently (exported for Server use)
+func (cm *ConnectionManager) IsDuplicate(sender, message string) bool {
 	// Create hash of sender + message
 	hash := sha256.Sum256([]byte(sender + "|" + message))
 	hashStr := hex.EncodeToString(hash[:8]) // Use first 8 bytes
-	
+
 	cm.seenMsgsMu.Lock()
 	defer cm.seenMsgsMu.Unlock()
-	
+
 	if _, seen := cm.seenMsgs[hashStr]; seen {
 		return true // Duplicate
 	}
-	
+
 	// Mark as seen
 	cm.seenMsgs[hashStr] = time.Now()
 	return false
@@ -85,7 +85,7 @@ func (cm *ConnectionManager) isDuplicate(sender, message string) bool {
 func (cm *ConnectionManager) cleanupSeenMsgs() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		cm.seenMsgsMu.Lock()
 		cutoff := time.Now().Add(-60 * time.Second)
@@ -191,9 +191,9 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			// System message (join/leave): use [System] format
 			message = strings.TrimPrefix(line, "SYSTEM:")
 			sender = "System"
-			
+
 			// Check for duplicate system messages
-			if cm.isDuplicate(sender, message) {
+			if cm.IsDuplicate(sender, message) {
 				continue
 			}
 			formatted = formatSystemMessage(message)
@@ -203,9 +203,9 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			if len(parts) == 2 {
 				sender = parts[0]
 				message = parts[1]
-				
+
 				// Check for duplicate messages
-				if cm.isDuplicate(sender, message) {
+				if cm.IsDuplicate(sender, message) {
 					continue
 				}
 				formatted = formatMessage(sender, message)
