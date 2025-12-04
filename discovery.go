@@ -2,220 +2,377 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"strings"
+	"sync"
+	"syscall"
 	"time"
-
-	"github.com/hashicorp/mdns"
 )
 
+const (
+	discoveryPort      = 19999 // Fixed UDP port for discovery broadcasts
+	broadcastAddr      = "255.255.255.255:19999"
+	localhostBroadcast = "127.255.255.255:19999"
+)
+
+// DiscoveryMessage is sent via UDP broadcast
+type DiscoveryMessage struct {
+	Type    string `json:"type"`    // "announce" or "query"
+	Room    string `json:"room"`    // Room name
+	Port    int    `json:"port"`    // QUIC server port
+	Version string `json:"version"` // Protocol version
+}
+
 type DiscoveryService struct {
-	server    *mdns.Server
-	roomName  string
-	localPort int
-	localIPs  []net.IP
+	roomName   string
+	localPort  int
+	conn       *net.UDPConn
+	peers      map[string]time.Time // addr -> last seen time
+	peersMu    sync.RWMutex
+	stopCh     chan struct{}
+	localAddrs map[string]bool // Our own addresses to filter out
+}
+
+type RoomInfo struct {
+	Name  string
+	Peers []string
 }
 
 func NewDiscoveryService(port int, roomName string) (*DiscoveryService, error) {
+	// Use ListenConfig with SO_REUSEADDR for multiple instances on same port
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			c.Control(func(fd uintptr) {
+				// SO_REUSEADDR allows multiple processes to bind to same port
+				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+			return opErr
+		},
+	}
+
+	// Listen on discovery port with address reuse
+	pc, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", discoveryPort))
+	if err != nil {
+		return nil, fmt.Errorf("failed to start discovery listener: %w", err)
+	}
+
+	conn := pc.(*net.UDPConn)
+	conn.SetReadBuffer(65535)
+
 	ds := &DiscoveryService{
-		roomName:  roomName,
-		localPort: port,
-		localIPs:  getLocalIPs(),
+		roomName:   roomName,
+		localPort:  port,
+		conn:       conn,
+		peers:      make(map[string]time.Time),
+		stopCh:     make(chan struct{}),
+		localAddrs: getLocalAddrsMap(port),
 	}
 
-	if err := ds.startAdvertising(); err != nil {
-		return nil, err
-	}
+	// Start listener
+	go ds.listenLoop()
 
+	// Start periodic announcements
+	go ds.announceLoop()
+
+	// Initial announcement
+	ds.announce()
+
+	log.Printf("[Discovery] Advertising '%s' on port %s", roomName, colorPort(port))
 	return ds, nil
 }
 
-func (ds *DiscoveryService) startAdvertising() error {
-	service := fmt.Sprintf("_%s._p2pmsg._udp", ds.roomName)
+func getLocalAddrsMap(port int) map[string]bool {
+	addrs := make(map[string]bool)
 
-	host, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("hostname error: %w", err)
+	// Add localhost
+	addrs[fmt.Sprintf("127.0.0.1:%d", port)] = true
+
+	// Add all interface IPs
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		ifAddrs, _ := iface.Addrs()
+		for _, addr := range ifAddrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipv4 := ipnet.IP.To4(); ipv4 != nil {
+					addrs[fmt.Sprintf("%s:%d", ipv4.String(), port)] = true
+				}
+			}
+		}
 	}
-
-	info := []string{
-		fmt.Sprintf("room=%s", ds.roomName),
-		"version=1.0",
-	}
-
-	serviceObj, err := mdns.NewMDNSService(
-		host,
-		service,
-		"",
-		"",
-		ds.localPort,
-		ds.localIPs, // Explicitly provide IPs
-		info,
-	)
-	if err != nil {
-		return fmt.Errorf("mdns service error: %w", err)
-	}
-
-	ds.server, err = mdns.NewServer(&mdns.Config{Zone: serviceObj})
-	if err != nil {
-		return fmt.Errorf("mdns server error: %w", err)
-	}
-
-	log.Printf("[Discovery] Advertising '%s' on port %d", ds.roomName, ds.localPort)
-	return nil
+	return addrs
 }
 
-// LookupPeers finds other peers, excluding self
-func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
-	service := fmt.Sprintf("_%s._p2pmsg._udp", ds.roomName)
-
-	entriesCh := make(chan *mdns.ServiceEntry, 10)
-	var peers []string
-
-	// Start lookup in background
-	go func() {
-		params := mdns.DefaultParams(service)
-		params.Entries = entriesCh
-		params.Timeout = 2 * time.Second
-
-		if err := mdns.Query(params); err != nil {
-			log.Printf("[Discovery] Query error: %v", err)
+func (ds *DiscoveryService) listenLoop() {
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ds.stopCh:
+			return
+		default:
 		}
-		close(entriesCh)
-	}()
 
-	// Collect results with timeout
-	timeout := time.After(3 * time.Second)
+		ds.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, remoteAddr, err := ds.conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		var msg DiscoveryMessage
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			continue
+		}
+
+		// Build peer address from message
+		peerAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), msg.Port)
+
+		// Skip our own messages
+		if ds.localAddrs[peerAddr] {
+			continue
+		}
+
+		// Handle message types
+		switch msg.Type {
+		case "announce":
+			// Store peer if same room
+			if msg.Room == ds.roomName {
+				ds.peersMu.Lock()
+				ds.peers[peerAddr] = time.Now()
+				ds.peersMu.Unlock()
+			}
+		case "query":
+			// Respond with announce if same room or query is for all rooms
+			if msg.Room == "" || msg.Room == ds.roomName {
+				// Send announce via broadcast AND directly back to queryer
+				ds.announce()
+				ds.announceToAddr(remoteAddr) // Direct response
+			}
+		}
+	}
+}
+
+func (ds *DiscoveryService) announceLoop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case entry, ok := <-entriesCh:
-			if !ok {
-				return peers, nil
-			}
-			if entry == nil || entry.Port == 0 {
-				continue
-			}
-
-			// Validate this is actually a P2P messenger service
-			if !ds.validateService(entry) {
-				continue
-			}
-
-			// Filter out common non-P2P ports
-			if ds.isCommonServicePort(entry.Port) {
-				continue
-			}
-
-			// Determine IP to use
-			var ip net.IP
-			if entry.AddrV4 != nil {
-				ip = entry.AddrV4
-			} else if entry.AddrV6 != nil {
-				ip = entry.AddrV6
-			} else {
-				continue
-			}
-
-			addr := fmt.Sprintf("%s:%d", ip.String(), entry.Port)
-
-			// Filter out self
-			if !ds.isSelf(ip, entry.Port) {
-				peers = append(peers, addr)
-			}
-
-		case <-timeout:
-			return peers, nil
-
-		case <-ctx.Done():
-			return peers, ctx.Err()
+		case <-ds.stopCh:
+			return
+		case <-ticker.C:
+			ds.announce()
+			ds.cleanupPeers()
 		}
 	}
 }
 
-// validateService checks if the service entry has the expected TXT records
-func (ds *DiscoveryService) validateService(entry *mdns.ServiceEntry) bool {
-	// Check if it has TXT records with our expected format
-	hasRoom := false
-	hasVersion := false
-
-	for _, txt := range entry.InfoFields {
-		if strings.HasPrefix(txt, "room=") {
-			hasRoom = true
-			// Verify it's the same room
-			room := strings.TrimPrefix(txt, "room=")
-			if room != ds.roomName {
-				return false // Different room
-			}
-		}
-		if strings.HasPrefix(txt, "version=") {
-			hasVersion = true
-		}
+func (ds *DiscoveryService) announce() {
+	msg := DiscoveryMessage{
+		Type:    "announce",
+		Room:    ds.roomName,
+		Port:    ds.localPort,
+		Version: "0.2",
 	}
 
-	// Must have both room and version to be valid
-	return hasRoom && hasVersion
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	// Broadcast to multiple addresses for reliability
+	broadcastAddrs := []string{
+		broadcastAddr,      // LAN broadcast
+		localhostBroadcast, // Localhost broadcast
+		"127.0.0.1:19999",  // Direct localhost
+	}
+
+	for _, addrStr := range broadcastAddrs {
+		addr, err := net.ResolveUDPAddr("udp4", addrStr)
+		if err != nil {
+			continue
+		}
+		ds.conn.WriteToUDP(data, addr)
+	}
 }
 
-// isCommonServicePort should filter out ports commonly used by other services
-func (ds *DiscoveryService) isCommonServicePort(port int) bool {
-	commonPorts := map[int]bool{
-		53:   true, // DNS
-		5353: true, // mDNS
-		5355: true, // LLMNR
-		1900: true, // SSDP
-		3702: true, // WS-Discovery
-		7000: true, // Common service port
-		8000: true, // Common HTTP
-		8080: true, // Common HTTP
+// announceToAddr sends announce directly to a specific address
+func (ds *DiscoveryService) announceToAddr(addr *net.UDPAddr) {
+	msg := DiscoveryMessage{
+		Type:    "announce",
+		Room:    ds.roomName,
+		Port:    ds.localPort,
+		Version: "0.2",
 	}
-	return commonPorts[port]
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	ds.conn.WriteToUDP(data, addr)
 }
 
-func (ds *DiscoveryService) isSelf(ip net.IP, port int) bool {
-	if port != ds.localPort {
-		return false
+func (ds *DiscoveryService) query() {
+	msg := DiscoveryMessage{
+		Type:    "query",
+		Room:    ds.roomName,
+		Port:    ds.localPort,
+		Version: "0.2",
 	}
 
-	for _, localIP := range ds.localIPs {
-		if localIP.Equal(ip) {
-			return true
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	// Broadcast query
+	broadcastAddrs := []string{
+		broadcastAddr,
+		localhostBroadcast,
+		"127.0.0.1:19999",
+	}
+
+	for _, addrStr := range broadcastAddrs {
+		addr, err := net.ResolveUDPAddr("udp4", addrStr)
+		if err != nil {
+			continue
+		}
+		ds.conn.WriteToUDP(data, addr)
+	}
+}
+
+func (ds *DiscoveryService) cleanupPeers() {
+	ds.peersMu.Lock()
+	defer ds.peersMu.Unlock()
+
+	// Remove peers not seen in 15 seconds
+	cutoff := time.Now().Add(-15 * time.Second)
+	for addr, lastSeen := range ds.peers {
+		if lastSeen.Before(cutoff) {
+			delete(ds.peers, addr)
 		}
 	}
+}
 
-	// Also check loopback
-	if ip.IsLoopback() {
-		return true
+// LookupPeers returns peers in the same room
+func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
+	// Send query to trigger responses
+	ds.query()
+
+	// Wait a bit for responses
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
-	return false
+	ds.peersMu.RLock()
+	defer ds.peersMu.RUnlock()
+
+	peers := make([]string, 0, len(ds.peers))
+	for addr := range ds.peers {
+		peers = append(peers, addr)
+	}
+	return peers, nil
 }
 
 func (ds *DiscoveryService) Shutdown() {
-	if ds.server != nil {
-		ds.server.Shutdown()
+	close(ds.stopCh)
+	if ds.conn != nil {
+		ds.conn.Close()
 	}
 }
 
-// Helper to get local IPs
-func getLocalIPs() []net.IP {
-	var ips []net.IP
-
-	addrs, err := net.InterfaceAddrs()
+// DiscoverAllRooms finds all available rooms on the network
+func DiscoverAllRooms(ctx context.Context) ([]RoomInfo, error) {
+	// Create temporary listener
+	addr := &net.UDPAddr{Port: 0, IP: net.IPv4zero}
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		return ips
+		return nil, err
+	}
+	defer conn.Close()
+
+	localAddrs := getLocalAddrsMap(0)            // We don't have a port yet, will filter by IP
+	roomsMap := make(map[string]map[string]bool) // room -> set of peers
+
+	// Send query for all rooms
+	queryMsg := DiscoveryMessage{
+		Type:    "query",
+		Room:    "", // Empty = query all rooms
+		Port:    0,
+		Version: "0.2",
+	}
+	data, _ := json.Marshal(queryMsg)
+
+	// Broadcast query
+	broadcastAddrs := []string{
+		broadcastAddr,
+		localhostBroadcast,
+		"127.0.0.1:19999",
+	}
+	for _, addrStr := range broadcastAddrs {
+		bAddr, _ := net.ResolveUDPAddr("udp4", addrStr)
+		conn.WriteToUDP(data, bAddr)
 	}
 
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				ips = append(ips, ipnet.IP)
+	// Listen for responses
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			goto done
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		var msg DiscoveryMessage
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			continue
+		}
+
+		if msg.Type != "announce" || msg.Room == "" || msg.Room == "private" {
+			continue
+		}
+
+		peerAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), msg.Port)
+
+		// Skip if it's our own IP (we check by IP only since we don't know our port yet)
+		isLocal := false
+		for localAddr := range localAddrs {
+			if len(localAddr) > 0 && localAddr[:len(localAddr)-1] == remoteAddr.IP.String() {
+				isLocal = true
+				break
 			}
 		}
+		if isLocal {
+			continue
+		}
+
+		if roomsMap[msg.Room] == nil {
+			roomsMap[msg.Room] = make(map[string]bool)
+		}
+		roomsMap[msg.Room][peerAddr] = true
 	}
 
-	return ips
+done:
+	// Convert to slice
+	var rooms []RoomInfo
+	for roomName, peersSet := range roomsMap {
+		peers := make([]string, 0, len(peersSet))
+		for peer := range peersSet {
+			peers = append(peers, peer)
+		}
+		rooms = append(rooms, RoomInfo{Name: roomName, Peers: peers})
+	}
+	return rooms, nil
 }
