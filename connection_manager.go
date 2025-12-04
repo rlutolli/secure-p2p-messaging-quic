@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -32,6 +34,10 @@ type ConnectionManager struct {
 	localPort   int
 	roomName    string
 	localAlias  string // Our alias for this session
+	
+	// Message deduplication
+	seenMsgsMu sync.Mutex
+	seenMsgs   map[string]time.Time // hash -> timestamp (for cleanup)
 }
 
 type ManagedConnection struct {
@@ -43,11 +49,52 @@ type ManagedConnection struct {
 }
 
 func NewConnectionManager(localPort int, roomName string) *ConnectionManager {
-	return &ConnectionManager{
+	cm := &ConnectionManager{
 		connections: make(map[string]*ManagedConnection),
 		localPort:   localPort,
 		roomName:    roomName,
 		localAlias:  generateLocalAlias(),
+		seenMsgs:    make(map[string]time.Time),
+	}
+	
+	// Start cleanup goroutine for old message hashes
+	go cm.cleanupSeenMsgs()
+	
+	return cm
+}
+
+// isDuplicate checks if we've seen this message recently
+func (cm *ConnectionManager) isDuplicate(sender, message string) bool {
+	// Create hash of sender + message
+	hash := sha256.Sum256([]byte(sender + "|" + message))
+	hashStr := hex.EncodeToString(hash[:8]) // Use first 8 bytes
+	
+	cm.seenMsgsMu.Lock()
+	defer cm.seenMsgsMu.Unlock()
+	
+	if _, seen := cm.seenMsgs[hashStr]; seen {
+		return true // Duplicate
+	}
+	
+	// Mark as seen
+	cm.seenMsgs[hashStr] = time.Now()
+	return false
+}
+
+// cleanupSeenMsgs periodically removes old message hashes
+func (cm *ConnectionManager) cleanupSeenMsgs() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		cm.seenMsgsMu.Lock()
+		cutoff := time.Now().Add(-60 * time.Second)
+		for hash, ts := range cm.seenMsgs {
+			if ts.Before(cutoff) {
+				delete(cm.seenMsgs, hash)
+			}
+		}
+		cm.seenMsgsMu.Unlock()
 	}
 }
 
@@ -138,17 +185,29 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 
 		// Parse message format: "SYSTEM:message", "FROM:alias|message", or "MSG:message"
 		var formatted string
+		var sender, message string
 
 		if strings.HasPrefix(line, "SYSTEM:") {
 			// System message (join/leave): use [System] format
-			message := strings.TrimPrefix(line, "SYSTEM:")
+			message = strings.TrimPrefix(line, "SYSTEM:")
+			sender = "System"
+			
+			// Check for duplicate system messages
+			if cm.isDuplicate(sender, message) {
+				continue
+			}
 			formatted = formatSystemMessage(message)
 		} else if strings.HasPrefix(line, "FROM:") {
 			// Broadcast message from Server: "FROM:alias|message"
 			parts := strings.SplitN(strings.TrimPrefix(line, "FROM:"), "|", 2)
 			if len(parts) == 2 {
-				sender := parts[0]
-				message := parts[1]
+				sender = parts[0]
+				message = parts[1]
+				
+				// Check for duplicate messages
+				if cm.isDuplicate(sender, message) {
+					continue
+				}
 				formatted = formatMessage(sender, message)
 			} else {
 				formatted = formatMessage(mc.peerAddr, line)

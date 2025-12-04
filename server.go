@@ -148,6 +148,8 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 	}
 
 	// Handle FROM:alias|content format (sent by ConnectionManager)
+	// Broadcast to other peers in room so they receive it (mesh relay)
+	// Receivers will deduplicate if they get the same message from multiple sources
 	if strings.HasPrefix(message, "FROM:") {
 		parts := strings.SplitN(strings.TrimPrefix(message, "FROM:"), "|", 2)
 		if len(parts) == 2 {
@@ -156,7 +158,9 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 			// Update peer's alias to match what they claim (trust the sender's alias)
 			peer.alias = senderAlias
 			if peer.room != nil {
+				// Broadcast to other peers (relay for mesh network)
 				s.broadcastToRoom(peer.room, peer.addr, content)
+				// Display locally
 				if s.onMessage != nil {
 					s.onMessage(senderAlias, peer.room.name, content)
 				}
