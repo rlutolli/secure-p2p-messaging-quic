@@ -295,7 +295,6 @@ func DiscoverAllRooms(ctx context.Context) ([]RoomInfo, error) {
 	}
 	defer conn.Close()
 
-	localAddrs := getLocalAddrsMap(0)            // We don't have a port yet, will filter by IP
 	roomsMap := make(map[string]map[string]bool) // room -> set of peers
 
 	// Send query for all rooms
@@ -346,20 +345,10 @@ func DiscoverAllRooms(ctx context.Context) ([]RoomInfo, error) {
 
 		peerAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), msg.Port)
 
-		// Skip if it's our own IP (we check by IP only since we don't know our port yet)
-		isLocal := false
-		for localAddr := range localAddrs {
-			// Properly extract IP from "IP:port" format using net.SplitHostPort
-			if localIP, _, err := net.SplitHostPort(localAddr); err == nil {
-				if localIP == remoteAddr.IP.String() {
-					isLocal = true
-					break
-				}
-			}
-		}
-		if isLocal {
-			continue
-		}
+		// Note: We don't filter by IP here because:
+		// 1. We don't know our own port yet (we use port 0)
+		// 2. IP-only filtering is too aggressive on localhost (filters out other terminals)
+		// 3. Self-filtering is handled more accurately in listenLoop using full IP:port addresses
 
 		if roomsMap[msg.Room] == nil {
 			roomsMap[msg.Room] = make(map[string]bool)
