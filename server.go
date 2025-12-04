@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -15,11 +16,13 @@ import (
 
 // Server handles incoming P2P connections
 type Server struct {
-	listener  *quic.Listener
-	rooms     map[string]*Room
-	roomsMu   sync.RWMutex
-	localPort int
-	onMessage func(from, room, message string)
+	listener        *quic.Listener
+	rooms           map[string]*Room
+	roomsMu         sync.RWMutex
+	localPort       int
+	onMessage       func(from, room, message string)
+	onSystemMessage func(message string) // Callback for system messages (join/leave)
+	connManager     *ConnectionManager   // Reference to connection manager for bidirectional messaging
 }
 
 type Room struct {
@@ -30,12 +33,25 @@ type Room struct {
 
 type Peer struct {
 	addr   string
+	alias  string
 	conn   *quic.Conn
 	stream *quic.Stream
 	room   *Room
 }
 
-func NewServer(addr string, onMessage func(from, room, message string)) (*Server, error) {
+// generateAlias creates a random alias for a peer
+func generateAlias() string {
+	adjectives := []string{"Swift", "Bold", "Clever", "Bright", "Quick", "Sharp", "Wise", "Calm", "Brave", "Cool"}
+	nouns := []string{"Fox", "Eagle", "Wolf", "Hawk", "Lion", "Tiger", "Bear", "Deer", "Bird", "Fish"}
+
+	adj := adjectives[rand.Intn(len(adjectives))]
+	noun := nouns[rand.Intn(len(nouns))]
+	num := rand.Intn(999) + 1
+
+	return fmt.Sprintf("%s%s%d", adj, noun, num)
+}
+
+func NewServer(addr string, onMessage func(from, room, message string), onSystemMessage func(message string), connManager *ConnectionManager) (*Server, error) {
 	tlsConfig := generateTLSConfig()
 
 	listener, err := quic.ListenAddr(addr, tlsConfig, &quic.Config{
@@ -52,15 +68,17 @@ func NewServer(addr string, onMessage func(from, room, message string)) (*Server
 	fmt.Sscanf(portStr, "%d", &port)
 
 	s := &Server{
-		listener:  listener,
-		rooms:     make(map[string]*Room),
-		localPort: port,
-		onMessage: onMessage,
+		listener:        listener,
+		rooms:           make(map[string]*Room),
+		localPort:       port,
+		onMessage:       onMessage,
+		onSystemMessage: onSystemMessage,
+		connManager:     connManager,
 	}
 
 	go s.acceptLoop()
 
-	log.Printf("[Server] Listening on port %d", port)
+	log.Printf("[Server] Listening on port %s", colorPort(port))
 	return s, nil
 }
 
@@ -90,8 +108,14 @@ func (s *Server) handleConnection(conn *quic.Conn) {
 		return
 	}
 
+	// Register incoming connection in ConnectionManager for bidirectional messaging
+	if s.connManager != nil {
+		s.connManager.RegisterIncoming(peerAddr, conn, stream)
+	}
+
 	peer := &Peer{
 		addr:   peerAddr,
+		alias:  generateAlias(),
 		conn:   conn,
 		stream: stream,
 	}
@@ -123,12 +147,30 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 		return
 	}
 
+	// Handle FROM:alias|content format (sent by ConnectionManager)
+	if strings.HasPrefix(message, "FROM:") {
+		parts := strings.SplitN(strings.TrimPrefix(message, "FROM:"), "|", 2)
+		if len(parts) == 2 {
+			senderAlias := parts[0]
+			content := parts[1]
+			// Update peer's alias to match what they claim (trust the sender's alias)
+			peer.alias = senderAlias
+			if peer.room != nil {
+				s.broadcastToRoom(peer.room, peer.addr, content)
+				if s.onMessage != nil {
+					s.onMessage(senderAlias, peer.room.name, content)
+				}
+			}
+		}
+		return
+	}
+
 	if strings.HasPrefix(message, "MSG:") {
 		content := strings.TrimPrefix(message, "MSG:")
 		if peer.room != nil {
 			s.broadcastToRoom(peer.room, peer.addr, content)
 			if s.onMessage != nil {
-				s.onMessage(peer.addr, peer.room.name, content)
+				s.onMessage(peer.alias, peer.room.name, content)
 			}
 		}
 		return
@@ -138,7 +180,7 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 	if peer.room != nil {
 		s.broadcastToRoom(peer.room, peer.addr, message)
 		if s.onMessage != nil {
-			s.onMessage(peer.addr, peer.room.name, message)
+			s.onMessage(peer.alias, peer.room.name, message)
 		}
 	}
 }
@@ -160,20 +202,49 @@ func (s *Server) joinRoom(peer *Peer, roomName string) {
 	peer.room = room
 	room.peersMu.Unlock()
 
-	log.Printf("[Server] Peer %s joined room '%s'", peer.addr, roomName)
+	// Broadcast join message to room AND display locally
+	joinMsg := fmt.Sprintf("%s (%s) joined the chat", peer.alias, peer.addr)
+	s.broadcastToRoom(room, "", joinMsg)
+
+	// Display join message locally (so room creator sees it)
+	if s.onSystemMessage != nil {
+		s.onSystemMessage(joinMsg)
+	}
+
+	log.Printf("[Server] Peer %s (%s) joined room '%s'", peer.alias, peer.addr, roomName)
 }
 
 func (s *Server) broadcastToRoom(room *Room, senderAddr, message string) {
 	room.peersMu.RLock()
 	peers := make([]*Peer, 0, len(room.peers))
+	var senderAlias string
 	for _, p := range room.peers {
-		if p.addr != senderAddr {
+		if p.addr == senderAddr {
+			senderAlias = p.alias
+		} else {
 			peers = append(peers, p)
 		}
 	}
 	room.peersMu.RUnlock()
 
-	formatted := fmt.Sprintf("FROM:%s|%s\n", senderAddr, message)
+	// Use alias if available, otherwise use address
+	// System messages use "System" as sender
+	from := senderAlias
+	isSystemMsg := false
+	if from == "" && senderAddr != "" {
+		from = senderAddr
+	} else if from == "" {
+		from = "System"
+		isSystemMsg = true
+	}
+
+	// System messages use SYSTEM: prefix for special formatting on receiver
+	var formatted string
+	if isSystemMsg {
+		formatted = fmt.Sprintf("SYSTEM:%s\n", message)
+	} else {
+		formatted = fmt.Sprintf("FROM:%s|%s\n", from, message)
+	}
 
 	for _, peer := range peers {
 		if _, err := peer.stream.Write([]byte(formatted)); err != nil {
@@ -187,6 +258,15 @@ func (s *Server) removePeer(peer *Peer) {
 		peer.room.peersMu.Lock()
 		delete(peer.room.peers, peer.addr)
 		peer.room.peersMu.Unlock()
+
+		// Broadcast leave message AND display locally
+		leaveMsg := fmt.Sprintf("%s (%s) left the chat", peer.alias, peer.addr)
+		s.broadcastToRoom(peer.room, "", leaveMsg)
+
+		// Display leave message locally
+		if s.onSystemMessage != nil {
+			s.onSystemMessage(leaveMsg)
+		}
 
 		log.Printf("[Server] Peer %s left room '%s'", peer.addr, peer.room.name)
 	}
