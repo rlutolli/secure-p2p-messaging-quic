@@ -349,9 +349,12 @@ func DiscoverAllRooms(ctx context.Context) ([]RoomInfo, error) {
 		// Skip if it's our own IP (we check by IP only since we don't know our port yet)
 		isLocal := false
 		for localAddr := range localAddrs {
-			if len(localAddr) > 0 && localAddr[:len(localAddr)-1] == remoteAddr.IP.String() {
-				isLocal = true
-				break
+			// Properly extract IP from "IP:port" format using net.SplitHostPort
+			if localIP, _, err := net.SplitHostPort(localAddr); err == nil {
+				if localIP == remoteAddr.IP.String() {
+					isLocal = true
+					break
+				}
 			}
 		}
 		if isLocal {
