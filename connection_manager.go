@@ -1,3 +1,10 @@
+/*
+connection_manager.go - Outgoing Connection Pool and Message Deduplication
+
+This file manages persistent connections to peers, handling outgoing messages
+and providing efficient connection reuse. It now supports both QUIC and TCP
+transports.
+*/
 package main
 
 import (
@@ -7,7 +14,9 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +43,7 @@ type ConnectionManager struct {
 	localPort   int
 	roomName    string
 	localAlias  string // Our alias for this session
+	useTCP      bool   // Preference for TCP over QUIC
 
 	// Message deduplication
 	seenMsgsMu sync.Mutex
@@ -41,24 +51,29 @@ type ConnectionManager struct {
 }
 
 type ManagedConnection struct {
-	conn      *quic.Conn
-	stream    *quic.Stream
+	conn      PeerConnection // Abstracted connection
 	peerAddr  string
 	createdAt time.Time
+	lastUsed  time.Time  // Track last usage for health checks
+	healthy   bool       // Connection health flag
 	mu        sync.Mutex
 }
 
-func NewConnectionManager(localPort int, roomName string) *ConnectionManager {
+func NewConnectionManager(localPort int, roomName string, useTCP bool) *ConnectionManager {
 	cm := &ConnectionManager{
 		connections: make(map[string]*ManagedConnection),
 		localPort:   localPort,
 		roomName:    roomName,
 		localAlias:  generateLocalAlias(),
 		seenMsgs:    make(map[string]time.Time),
+		useTCP:      useTCP,
 	}
 
 	// Start cleanup goroutine for old message hashes
 	go cm.cleanupSeenMsgs()
+
+	// Start connection health check goroutine
+	go cm.healthCheck()
 
 	return cm
 }
@@ -98,6 +113,32 @@ func (cm *ConnectionManager) cleanupSeenMsgs() {
 	}
 }
 
+// healthCheck periodically checks connection health and cleans up stale connections
+func (cm *ConnectionManager) healthCheck() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cm.mu.RLock()
+		staleConnections := make([]string, 0)
+		for addr, mc := range cm.connections {
+			mc.mu.Lock()
+			// Mark connections as unhealthy if idle for too long
+			if time.Since(mc.lastUsed) > 120*time.Second {
+				mc.healthy = false
+				staleConnections = append(staleConnections, addr)
+			}
+			mc.mu.Unlock()
+		}
+		cm.mu.RUnlock()
+
+		// Log stale connections (don't remove them, just mark unhealthy)
+		for _, addr := range staleConnections {
+			log.Printf("[ConnectionManager] Connection to %s marked unhealthy (idle > 120s)", addr)
+		}
+	}
+}
+
 // GetLocalAlias returns our alias for display
 func (cm *ConnectionManager) GetLocalAlias() string {
 	return cm.localAlias
@@ -127,37 +168,74 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 		return mc, nil
 	}
 
+	var pc PeerConnection
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"p2p-messenger/1.0"},
 	}
 
-	conn, err := quic.DialAddr(ctx, peerAddr, tlsConf, &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
-		MaxIdleTimeout:  30 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("dial failed: %w", err)
-	}
+	if cm.useTCP {
+		// TCP Dial
+		d := net.Dialer{Timeout: 10 * time.Second}
+		rawConn, err := d.DialContext(ctx, "tcp", peerAddr)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial failed: %w", err)
+		}
+		
+		tlsConn := tls.Client(rawConn, tlsConf)
+		// TLS Handshake is implicit on first Read/Write, but good to check
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("tls handshake failed: %w", err)
+		}
+		
+		pc = &NetConnWrapper{Conn: tlsConn}
 
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		conn.CloseWithError(1, "stream open failed")
-		return nil, fmt.Errorf("stream open failed: %w", err)
+	} else {
+		// QUIC Dial with AGGRESSIVE optimized config (from research)
+		// See: "Optimizing quic-go for Localhost Latency.md"
+		conn, err := quic.DialAddr(ctx, peerAddr, tlsConf, &quic.Config{
+			MaxIdleTimeout:                 5 * time.Minute,
+			KeepAlivePeriod:                30 * time.Second,
+			MaxIncomingStreams:             1000,
+			MaxIncomingUniStreams:          1000,
+			InitialStreamReceiveWindow:     6 * 1024 * 1024,  // 6 MB
+			InitialConnectionReceiveWindow: 15 * 1024 * 1024, // 15 MB
+			MaxStreamReceiveWindow:         16 * 1024 * 1024, // 16 MB
+			MaxConnectionReceiveWindow:     64 * 1024 * 1024, // 64 MB
+			Allow0RTT:                      true,
+			DisablePathMTUDiscovery:        false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("quic dial failed: %w", err)
+		}
+
+		stream, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			conn.CloseWithError(1, "stream open failed")
+			return nil, fmt.Errorf("stream open failed: %w", err)
+		}
+
+		pc = &QuicConnectionWrapper{
+			Stream: stream,
+			Conn:   conn,
+		}
 	}
 
 	// Send initial handshake with room info
 	handshake := fmt.Sprintf("JOIN:%s\n", cm.roomName)
-	if _, err := stream.Write([]byte(handshake)); err != nil {
-		conn.CloseWithError(1, "handshake failed")
+	if _, err := pc.Write([]byte(handshake)); err != nil {
+		pc.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
 
 	mc := &ManagedConnection{
-		conn:      conn,
-		stream:    stream,
+		conn:      pc,
 		peerAddr:  peerAddr,
 		createdAt: time.Now(),
+		lastUsed:  time.Now(),
+		healthy:   true,
 	}
 
 	cm.connections[peerAddr] = mc
@@ -171,7 +249,7 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 	defer cm.removeConnection(mc.peerAddr)
 
-	reader := bufio.NewReader(mc.stream)
+	reader := bufio.NewReader(mc.conn)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -230,7 +308,7 @@ func (cm *ConnectionManager) removeConnection(peerAddr string) {
 	defer cm.mu.Unlock()
 
 	if mc, exists := cm.connections[peerAddr]; exists {
-		mc.conn.CloseWithError(0, "closing")
+		mc.conn.Close()
 		delete(cm.connections, peerAddr)
 	}
 }
@@ -245,9 +323,12 @@ func (cm *ConnectionManager) Send(ctx context.Context, peerAddr, message string)
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
+	// Update lastUsed for connection health tracking
+	mc.lastUsed = time.Now()
+
 	// Format message with FROM: prefix including our alias so receiver knows who sent it
 	formatted := fmt.Sprintf("FROM:%s|%s\n", cm.localAlias, message)
-	_, err = mc.stream.Write([]byte(formatted))
+	_, err = mc.conn.Write([]byte(formatted))
 	return err
 }
 
@@ -270,9 +351,8 @@ func (cm *ConnectionManager) Broadcast(ctx context.Context, message string) []er
 }
 
 // RegisterIncoming registers an incoming connection (from Server) in the ConnectionManager
-// This enables bidirectional messaging - when someone connects to us, we can send messages back
-// NOTE: Does NOT start readLoop - the Server already handles reading from this stream
-func (cm *ConnectionManager) RegisterIncoming(peerAddr string, conn *quic.Conn, stream *quic.Stream) {
+// This enables bidirectional messaging
+func (cm *ConnectionManager) RegisterIncoming(peerAddr string, pc PeerConnection) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -282,14 +362,13 @@ func (cm *ConnectionManager) RegisterIncoming(peerAddr string, conn *quic.Conn, 
 	}
 
 	mc := &ManagedConnection{
-		conn:      conn,
-		stream:    stream,
+		conn:      pc,
 		peerAddr:  peerAddr,
 		createdAt: time.Now(),
 	}
 
 	cm.connections[peerAddr] = mc
-	// Do NOT start readLoop here - Server.handleConnection already reads from this stream
+	// Do NOT start readLoop here - Server.handleConnection already reads from this connection
 }
 
 // Close all connections
@@ -298,7 +377,7 @@ func (cm *ConnectionManager) Close() {
 	defer cm.mu.Unlock()
 
 	for addr, mc := range cm.connections {
-		mc.conn.CloseWithError(0, "shutdown")
+		mc.conn.Close()
 		delete(cm.connections, addr)
 	}
 }
