@@ -1,3 +1,39 @@
+/*
+Package main implements a secure peer-to-peer messaging application using QUIC or TCP.
+
+Secure P2P Messenger is a decentralized chat application that enables real-time text
+messaging between peers on a Local Area Network (LAN). Leverages QUIC or TCP for transport-layer
+security (TLS 1.3) and uses UDP broadcasts for automatic peer discovery.
+
+Key Features:
+  - Automatic LAN peer discovery via UDP broadcasts
+  - Room-based chat with logical peer grouping
+  - Bidirectional message relay (mesh networking)
+  - TLS 1.3 encryption (QUIC or TCP)
+  - Persistent connection pooling for efficiency
+  - Private mode to hide from discovery
+
+Architecture Overview:
+  - main.go:               Application entry point, CLI, and orchestration (this file)
+  - server.go:             QUIC/TCP server for incoming connections and room management
+  - connection_manager.go: Outgoing connection pool/dialer
+  - transort.go:           Connection abstraction interface
+  - discovery.go:          UDP broadcast-based LAN peer discovery
+  - security.go:           TLS certificate generation (ECDSA P-256)
+  - client.go:             Legacy client functions for backward compatibility
+
+Usage:
+
+	./p2p-messenger [--debug | -d] [--use-tcp | -t]
+
+Commands:
+  - Type any text to send to all peers in the room
+  - /help      - Show available commands
+  - /peers     - List connected peers
+  - /connect   - Connect to a specific peer
+  - /room      - Show room info
+  - exit/quit  - Exit application
+*/
 package main
 
 import (
@@ -14,7 +50,8 @@ import (
 	"time"
 )
 
-// Global debug mode flag
+// debugMode controls verbose logging output. When false, log output is discarded.
+// Enable with --debug or -d command-line flag.
 var debugMode = false
 
 // ANSI color codes for usernames (shared with connection_manager.go)
@@ -67,6 +104,7 @@ type App struct {
 	connManager *ConnectionManager
 	roomName    string
 	isPrivate   bool
+	useTCP      bool
 }
 
 // Spinner for discovery progress
@@ -89,10 +127,15 @@ func runSpinner(done chan bool, message string) {
 }
 
 func main() {
+	var useTCP bool
+
 	// Parse command line arguments
 	for _, arg := range os.Args[1:] {
 		if arg == "--debug" || arg == "-d" {
 			debugMode = true
+		}
+		if arg == "--use-tcp" || arg == "-t" {
+			useTCP = true
 		}
 	}
 
@@ -103,7 +146,7 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Println("Secure P2P Messenger (v0.2)")
+	fmt.Printf("Secure P2P Messenger (v0.3 - TCP Support: %v)\n", useTCP)
 
 	// 1. Discover available rooms with spinner (UDP is fast, 4 second timeout)
 	done := make(chan bool)
@@ -126,7 +169,7 @@ func main() {
 		for i, room := range rooms {
 			fmt.Printf("  %s%d%s. %s (%d peer(s))\n", colorCyan, i+1, colorReset, room.Name, len(room.Peers))
 		}
-		fmt.Println("  n. Create new room")
+		fmt.Println("  n. Create new room")	
 		fmt.Println("  p. Private mode (hidden)")
 		fmt.Print("\nSelect option: ")
 
@@ -169,7 +212,7 @@ func main() {
 	}
 
 	// 2. Initialize application
-	app, err := initializeApp(roomName, isPrivate)
+	app, err := initializeApp(roomName, isPrivate, useTCP)
 	if err != nil {
 		fmt.Printf("Failed to start: %v\n", err)
 		os.Exit(1)
@@ -205,24 +248,26 @@ func main() {
 	}()
 
 	// 5. Print status and show commands
-	fmt.Printf("\nStarted | Port: %s%d%s | Room: %s | You: %s%s%s\n",
+	fmt.Printf("\nStarted | Port: %s%d%s | Room: %s | You: %s%s%s | TCP: %v\n",
 		colorCyan, app.server.Port(), colorReset,
 		roomName,
-		colorGreen, app.connManager.GetLocalAlias(), colorReset)
+		colorGreen, app.connManager.GetLocalAlias(), colorReset,
+		useTCP)
 	app.showHelp()
 
 	// 6. Interactive CLI
 	app.runCLI()
 }
 
-func initializeApp(roomName string, isPrivate bool) (*App, error) {
+func initializeApp(roomName string, isPrivate bool, useTCP bool) (*App, error) {
 	app := &App{
 		roomName:  roomName,
 		isPrivate: isPrivate,
+		useTCP:    useTCP,
 	}
 
 	// Initialize connection manager first (needed by server)
-	app.connManager = NewConnectionManager(0, roomName) // Port will be set after server starts
+	app.connManager = NewConnectionManager(0, roomName, useTCP) // Port will be set after server starts
 
 	// Message handler callback - displays messages received via Server (incoming connections)
 	onMessage := func(from, room, message string) {
@@ -238,6 +283,7 @@ func initializeApp(roomName string, isPrivate bool) (*App, error) {
 	}
 
 	// Start server (pass ConnectionManager for bidirectional messaging)
+	// Server listens on both TCP and QUIC always
 	server, err := NewServer("0.0.0.0:0", onMessage, onSystemMessage, app.connManager)
 	if err != nil {
 		return nil, fmt.Errorf("server start failed: %w", err)
