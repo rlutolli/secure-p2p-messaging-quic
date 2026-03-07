@@ -1,5 +1,6 @@
 # Binaries for programs and plugins
 secure-p2p-messaging-quic
+p2p-messenger
 *.exe
 *.exe~
 *.dll
@@ -24,3 +25,9 @@ secure-p2p-messaging-quic
 *.pem
 *.key
 *.crt
+
+# TLS session key log – NEVER commit; contains secrets that decrypt traffic
+tls_keys.log
+
+# Log files
+*.log
