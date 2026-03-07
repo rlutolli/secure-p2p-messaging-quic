@@ -1,9 +1,5 @@
 /*
 connection_manager.go - Outgoing Connection Pool and Message Deduplication
-
-This file manages persistent connections to peers, handling outgoing messages
-and providing efficient connection reuse. It now supports both QUIC and TCP
-transports.
 */
 package main
 
@@ -12,10 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -24,79 +20,70 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// generateAlias creates a random alias for the local user
-func generateLocalAlias() string {
-	adjectives := []string{"Swift", "Bold", "Clever", "Bright", "Quick", "Sharp", "Wise", "Calm", "Brave", "Cool"}
-	nouns := []string{"Fox", "Eagle", "Wolf", "Hawk", "Lion", "Tiger", "Bear", "Deer", "Bird", "Fish"}
-
-	adj := adjectives[rand.Intn(len(adjectives))]
-	noun := nouns[rand.Intn(len(nouns))]
-	num := rand.Intn(999) + 1
-
-	return fmt.Sprintf("%s%s%d", adj, noun, num)
-}
-
-// ConnectionManager handles persistent connections to peers
 type ConnectionManager struct {
 	mu          sync.RWMutex
-	connections map[string]*ManagedConnection // peerAddr -> connection
+	connections map[string]*ManagedConnection
 	localPort   int
 	roomName    string
-	localAlias  string // Our alias for this session
-	useTCP      bool   // Preference for TCP over QUIC
+	localAlias  string
+	useTCP      bool
 
-	// Message deduplication
+	sessionCache tls.ClientSessionCache
+
 	seenMsgsMu sync.Mutex
-	seenMsgs   map[string]time.Time // hash -> timestamp (for cleanup)
+	seenMsgs   map[string]time.Time
+
+	// TOFU: stores the SHA-256 fingerprint of each peer's certificate on first connect.
+	// Reconnections that present a different certificate are rejected.
+	tofuMu           sync.RWMutex
+	tofuFingerprints map[string]string
+
+	pendingPingsMu sync.Mutex
+	pendingPings   map[string]time.Time
 }
 
 type ManagedConnection struct {
-	conn      PeerConnection // Abstracted connection
+	conn      PeerConnection
 	peerAddr  string
 	createdAt time.Time
-	lastUsed  time.Time  // Track last usage for health checks
-	healthy   bool       // Connection health flag
+	lastUsed  time.Time
 	mu        sync.Mutex
 }
 
 func NewConnectionManager(localPort int, roomName string, useTCP bool) *ConnectionManager {
 	cm := &ConnectionManager{
-		connections: make(map[string]*ManagedConnection),
-		localPort:   localPort,
-		roomName:    roomName,
-		localAlias:  generateLocalAlias(),
-		seenMsgs:    make(map[string]time.Time),
-		useTCP:      useTCP,
+		connections:      make(map[string]*ManagedConnection),
+		localPort:        localPort,
+		roomName:         roomName,
+		localAlias:       generateAlias(),
+		seenMsgs:         make(map[string]time.Time),
+		useTCP:           useTCP,
+		sessionCache:     tls.NewLRUClientSessionCache(100),
+		tofuFingerprints: make(map[string]string),
+		pendingPings:     make(map[string]time.Time),
 	}
 
-	// Start cleanup goroutine for old message hashes
 	go cm.cleanupSeenMsgs()
-
-	// Start connection health check goroutine
 	go cm.healthCheck()
 
 	return cm
 }
 
-// IsDuplicate checks if we've seen this message recently (exported for Server use)
 func (cm *ConnectionManager) IsDuplicate(sender, message string) bool {
-	// Create hash of sender + message
 	hash := sha256.Sum256([]byte(sender + "|" + message))
-	hashStr := hex.EncodeToString(hash[:8]) // Use first 8 bytes
+	hashStr := hex.EncodeToString(hash[:8])
 
 	cm.seenMsgsMu.Lock()
 	defer cm.seenMsgsMu.Unlock()
 
 	if _, seen := cm.seenMsgs[hashStr]; seen {
-		return true // Duplicate
+		return true
 	}
 
-	// Mark as seen
 	cm.seenMsgs[hashStr] = time.Now()
 	return false
 }
 
-// cleanupSeenMsgs periodically removes old message hashes
 func (cm *ConnectionManager) cleanupSeenMsgs() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -113,57 +100,77 @@ func (cm *ConnectionManager) cleanupSeenMsgs() {
 	}
 }
 
-// healthCheck periodically checks connection health and cleans up stale connections
 func (cm *ConnectionManager) healthCheck() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		cm.mu.RLock()
-		staleConnections := make([]string, 0)
-		for addr, mc := range cm.connections {
-			mc.mu.Lock()
-			// Mark connections as unhealthy if idle for too long
-			if time.Since(mc.lastUsed) > 120*time.Second {
-				mc.healthy = false
-				staleConnections = append(staleConnections, addr)
-			}
-			mc.mu.Unlock()
+		addrs := make([]string, 0, len(cm.connections))
+		for addr := range cm.connections {
+			addrs = append(addrs, addr)
 		}
 		cm.mu.RUnlock()
 
-		// Log stale connections (don't remove them, just mark unhealthy)
-		for _, addr := range staleConnections {
-			log.Printf("[ConnectionManager] Connection to %s marked unhealthy (idle > 120s)", addr)
+		var dead []string
+
+		cm.pendingPingsMu.Lock()
+		for _, addr := range addrs {
+			if sent, pending := cm.pendingPings[addr]; pending {
+				if time.Since(sent) > 10*time.Second {
+					dead = append(dead, addr)
+				}
+				continue
+			}
+
+			cm.mu.RLock()
+			mc, ok := cm.connections[addr]
+			cm.mu.RUnlock()
+			if !ok {
+				continue
+			}
+
+			cm.pendingPings[addr] = time.Now()
+			go func(c *ManagedConnection) {
+				c.mu.Lock()
+				c.conn.Write([]byte("PING\n"))
+				c.mu.Unlock()
+			}(mc)
+		}
+		cm.pendingPingsMu.Unlock()
+
+		for _, addr := range dead {
+			cm.pendingPingsMu.Lock()
+			delete(cm.pendingPings, addr)
+			cm.pendingPingsMu.Unlock()
+
+			log.Printf("[ConnectionManager] Peer %s is unresponsive, removing", addr)
+			fmt.Printf("\n%s\n> ", formatSystemMessage(addr+" disconnected (no response to ping)"))
+			cm.removeConnection(addr)
 		}
 	}
 }
 
-// GetLocalAlias returns our alias for display
 func (cm *ConnectionManager) GetLocalAlias() string {
 	return cm.localAlias
 }
 
-// GetOrCreate returns existing connection or creates new one (exported)
 func (cm *ConnectionManager) GetOrCreate(ctx context.Context, peerAddr string) (*ManagedConnection, error) {
 	return cm.getOrCreate(ctx, peerAddr)
 }
 
-// getOrCreate is the internal implementation
 func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (*ManagedConnection, error) {
-	// Check for existing connection
 	cm.mu.RLock()
-	if mc, exists := cm.connections[peerAddr]; exists {
-		cm.mu.RUnlock()
-		return mc, nil
-	}
+	mc, exists := cm.connections[peerAddr]
 	cm.mu.RUnlock()
 
-	// Create new connection
+	if exists {
+		return mc, nil
+	}
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Double-check after acquiring write lock
 	if mc, exists := cm.connections[peerAddr]; exists {
 		return mc, nil
 	}
@@ -173,37 +180,52 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"p2p-messenger/1.0"},
+		ClientSessionCache: cm.sessionCache,
+		KeyLogWriter:       globalKeyLog,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificate from peer %s", peerAddr)
+			}
+			fp := sha256.Sum256(rawCerts[0])
+			fpHex := hex.EncodeToString(fp[:])
+
+			cm.tofuMu.Lock()
+			defer cm.tofuMu.Unlock()
+
+			if known, ok := cm.tofuFingerprints[peerAddr]; !ok {
+				cm.tofuFingerprints[peerAddr] = fpHex
+			} else if known != fpHex {
+				return fmt.Errorf("TOFU: certificate fingerprint mismatch for %s (possible MITM)", peerAddr)
+			}
+			return nil
+		},
 	}
 
 	if cm.useTCP {
-		// TCP Dial
 		d := net.Dialer{Timeout: 10 * time.Second}
 		rawConn, err := d.DialContext(ctx, "tcp", peerAddr)
 		if err != nil {
 			return nil, fmt.Errorf("tcp dial failed: %w", err)
 		}
-		
+
 		tlsConn := tls.Client(rawConn, tlsConf)
-		// TLS Handshake is implicit on first Read/Write, but good to check
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
 			return nil, fmt.Errorf("tls handshake failed: %w", err)
 		}
-		
+
 		pc = &NetConnWrapper{Conn: tlsConn}
 
 	} else {
-		// QUIC Dial with AGGRESSIVE optimized config (from research)
-		// See: "Optimizing quic-go for Localhost Latency.md"
 		conn, err := quic.DialAddr(ctx, peerAddr, tlsConf, &quic.Config{
-			MaxIdleTimeout:                 5 * time.Minute,
-			KeepAlivePeriod:                30 * time.Second,
-			MaxIncomingStreams:             1000,
-			MaxIncomingUniStreams:          1000,
-			InitialStreamReceiveWindow:     6 * 1024 * 1024,  // 6 MB
-			InitialConnectionReceiveWindow: 15 * 1024 * 1024, // 15 MB
-			MaxStreamReceiveWindow:         16 * 1024 * 1024, // 16 MB
-			MaxConnectionReceiveWindow:     64 * 1024 * 1024, // 64 MB
+			MaxIdleTimeout:                 QUICIdleTimeout,
+			KeepAlivePeriod:                QUICKeepAlive,
+			MaxIncomingStreams:             QUICMaxIncomingStreams,
+			MaxIncomingUniStreams:          QUICMaxIncomingUniStreams,
+			InitialStreamReceiveWindow:     QUICInitialStreamWindow,
+			InitialConnectionReceiveWindow: QUICInitialConnWindow,
+			MaxStreamReceiveWindow:         QUICMaxStreamWindow,
+			MaxConnectionReceiveWindow:     QUICMaxConnWindow,
 			Allow0RTT:                      true,
 			DisablePathMTUDiscovery:        false,
 		})
@@ -223,24 +245,21 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 		}
 	}
 
-	// Send initial handshake with room info
-	handshake := fmt.Sprintf("JOIN:%s\n", cm.roomName)
+	handshake := fmt.Sprintf("JOIN:%s|%s\n", cm.roomName, cm.localAlias)
 	if _, err := pc.Write([]byte(handshake)); err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
 
-	mc := &ManagedConnection{
+	mc = &ManagedConnection{
 		conn:      pc,
 		peerAddr:  peerAddr,
 		createdAt: time.Now(),
 		lastUsed:  time.Now(),
-		healthy:   true,
 	}
 
 	cm.connections[peerAddr] = mc
 
-	// Start reader goroutine for incoming messages
 	go cm.readLoop(mc)
 
 	return mc, nil
@@ -261,28 +280,40 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			continue
 		}
 
-		// Parse message format: "SYSTEM:message", "FROM:alias|message", or "MSG:message"
+		if line == "PONG" {
+			mc.mu.Lock()
+			mc.lastUsed = time.Now()
+			mc.mu.Unlock()
+			cm.pendingPingsMu.Lock()
+			delete(cm.pendingPings, mc.peerAddr)
+			cm.pendingPingsMu.Unlock()
+			continue
+		}
+
+		if line == "PING" {
+			mc.mu.Lock()
+			mc.conn.Write([]byte("PONG\n"))
+			mc.mu.Unlock()
+			continue
+		}
+
 		var formatted string
 		var sender, message string
 
 		if strings.HasPrefix(line, "SYSTEM:") {
-			// System message (join/leave): use [System] format
 			message = strings.TrimPrefix(line, "SYSTEM:")
 			sender = "System"
 
-			// Check for duplicate system messages
 			if cm.IsDuplicate(sender, message) {
 				continue
 			}
 			formatted = formatSystemMessage(message)
 		} else if strings.HasPrefix(line, "FROM:") {
-			// Broadcast message from Server: "FROM:alias|message"
 			parts := strings.SplitN(strings.TrimPrefix(line, "FROM:"), "|", 2)
 			if len(parts) == 2 {
 				sender = parts[0]
 				message = parts[1]
 
-				// Check for duplicate messages
 				if cm.IsDuplicate(sender, message) {
 					continue
 				}
@@ -291,11 +322,9 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 				formatted = formatMessage(mc.peerAddr, line)
 			}
 		} else if strings.HasPrefix(line, "MSG:") {
-			// Direct message: "MSG:message" - strip prefix, use peer address as sender
 			message := strings.TrimPrefix(line, "MSG:")
 			formatted = formatMessage(mc.peerAddr, message)
 		} else {
-			// Fallback: treat as raw message
 			formatted = formatMessage(mc.peerAddr, line)
 		}
 
@@ -313,7 +342,6 @@ func (cm *ConnectionManager) removeConnection(peerAddr string) {
 	}
 }
 
-// Send message to a specific peer
 func (cm *ConnectionManager) Send(ctx context.Context, peerAddr, message string) error {
 	mc, err := cm.getOrCreate(ctx, peerAddr)
 	if err != nil {
@@ -323,55 +351,44 @@ func (cm *ConnectionManager) Send(ctx context.Context, peerAddr, message string)
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	// Update lastUsed for connection health tracking
 	mc.lastUsed = time.Now()
 
-	// Format message with FROM: prefix including our alias so receiver knows who sent it
-	formatted := fmt.Sprintf("FROM:%s|%s\n", cm.localAlias, message)
+	alias := sanitiseField(cm.localAlias)
+	msg := sanitiseField(message)
+
+	formatted := fmt.Sprintf("FROM:%s|%s\n", alias, msg)
 	_, err = mc.conn.Write([]byte(formatted))
 	return err
 }
 
-// Broadcast sends to all connected peers
-func (cm *ConnectionManager) Broadcast(ctx context.Context, message string) []error {
+func (cm *ConnectionManager) ListConnected() []string {
 	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	addrs := make([]string, 0, len(cm.connections))
 	for addr := range cm.connections {
 		addrs = append(addrs, addr)
 	}
-	cm.mu.RUnlock()
-
-	var errors []error
-	for _, addr := range addrs {
-		if err := cm.Send(ctx, addr, message); err != nil {
-			errors = append(errors, fmt.Errorf("%s: %w", addr, err))
-		}
-	}
-	return errors
+	return addrs
 }
 
-// RegisterIncoming registers an incoming connection (from Server) in the ConnectionManager
-// This enables bidirectional messaging
 func (cm *ConnectionManager) RegisterIncoming(peerAddr string, pc PeerConnection) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Check if already registered
 	if _, exists := cm.connections[peerAddr]; exists {
-		return // Already registered
+		return
 	}
 
 	mc := &ManagedConnection{
 		conn:      pc,
 		peerAddr:  peerAddr,
 		createdAt: time.Now(),
+		lastUsed:  time.Now(),
 	}
 
 	cm.connections[peerAddr] = mc
-	// Do NOT start readLoop here - Server.handleConnection already reads from this connection
 }
 
-// Close all connections
 func (cm *ConnectionManager) Close() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
