@@ -9,44 +9,60 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"log"
 	"math/big"
 	"net"
+	"os"
 	"time"
 )
 
-// generateTLSConfig creates a self-signed certificate for QUIC
+var globalKeyLog io.WriteCloser
+
+func init() {
+	path := os.Getenv("SSLKEYLOGFILE")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("[TLS] WARNING: cannot open SSLKEYLOGFILE %q: %v", path, err)
+		return
+	}
+	globalKeyLog = f
+	log.Printf("[TLS] Key logging enabled → %s", path)
+}
+
 func generateTLSConfig() *tls.Config {
-	// Use ECDSA P-256 (more efficient than RSA for TLS 1.3)
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		panic(fmt.Sprintf("failed to generate private key: %v", err))
 	}
 
-	// Create certificate template
 	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+
+	localIPs := collectLocalIPs()
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"P2P Messenger"},
-			CommonName:   "localhost",
+			CommonName:   "p2p-messenger",
 		},
 		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour), // Short-lived cert
+		NotAfter:              time.Now().Add(7 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IPAddresses:           localIPs,
 		DNSNames:              []string{"localhost"},
 	}
 
-	// Self-sign the certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		panic(fmt.Sprintf("failed to create certificate: %v", err))
 	}
 
-	// Encode to PEM
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
 	keyDER, err := x509.MarshalECPrivateKey(privateKey)
@@ -60,25 +76,35 @@ func generateTLSConfig() *tls.Config {
 		panic(fmt.Sprintf("failed to create TLS certificate: %v", err))
 	}
 
-	return &tls.Config{
+	cfg := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"p2p-messenger/1.0"},
-		MinVersion:   tls.VersionTLS13, // QUIC requires TLS 1.3
+		MinVersion:   tls.VersionTLS13,
 	}
+	if globalKeyLog != nil {
+		cfg.KeyLogWriter = globalKeyLog
+	}
+	return cfg
 }
 
-// For future: Password-derived room encryption
+func collectLocalIPs() []net.IP {
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP != nil {
+				ips = append(ips, ipnet.IP)
+			}
+		}
+	}
+	return ips
+}
+
 type RoomCrypto struct {
 	roomKey []byte
 }
 
-// DeriveRoomKey creates a key from room name + password
-// This would be used for end-to-end encryption within rooms
 func DeriveRoomKey(roomName, password string) (*RoomCrypto, error) {
-	// Use Argon2id for key derivation (add golang.org/x/crypto/argon2)
-	// salt := sha256.Sum256([]byte(roomName))
-	// key := argon2.IDKey([]byte(password), salt[:], 1, 64*1024, 4, 32)
-
-	// Placeholder - implement with proper KDF
 	return &RoomCrypto{}, nil
 }
