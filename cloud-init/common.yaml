@@ -1,0 +1,128 @@
+#cloud-config
+# ─────────────────────────────────────────────────────────────────────────────
+# Provisioning config for both Multipass VMs (node-a and node-b).
+#
+# What this installs:
+#   • XFCE4 desktop   → full GUI accessible via browser (noVNC on port 6080)
+#   • x11vnc          → VNC server attached to the virtual framebuffer
+#   • noVNC + websockify → browser-based VNC client (no separate app needed)
+#   • Go (latest)     → to build the p2p-messenger binary inside the VM
+#   • supervisor      → keeps Xvfb / XFCE4 / x11vnc / noVNC alive on boot
+#
+# Access after vm-setup.sh completes:
+#   Browser desktop : http://<vm-ip>:6080/vnc.html   (password: ubuntu)
+#   CLI shell       : multipass shell node-a
+# ─────────────────────────────────────────────────────────────────────────────
+
+package_update: true
+
+packages:
+  # Core desktop
+  - xfce4
+  - xfce4-terminal
+  - xfce4-goodies
+  # Virtual framebuffer + VNC
+  - xvfb
+  - x11vnc
+  # noVNC browser client
+  - novnc
+  - websockify
+  # Process supervisor (keeps everything running across reboots)
+  - supervisor
+  # General utilities
+  - wget
+  - git
+  - net-tools
+  - htop
+  - dbus-x11
+
+# ── supervisor config ─────────────────────────────────────────────────────────
+# Written before runcmd so supervisor picks it up when started.
+write_files:
+  - path: /etc/supervisor/conf.d/desktop.conf
+    content: |
+      ; Startup order: Xvfb → XFCE4 → x11vnc → noVNC
+      ; Sleep commands ensure each layer is ready before the next starts.
+
+      [program:xvfb]
+      command=/usr/bin/Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset
+      autostart=true
+      autorestart=true
+      priority=10
+      stdout_logfile=/var/log/supervisor/xvfb.log
+      stderr_logfile=/var/log/supervisor/xvfb.err.log
+
+      [program:xfce4]
+      command=/bin/bash -c "sleep 3 && dbus-launch --exit-with-session startxfce4"
+      environment=DISPLAY=":1",HOME="/home/ubuntu",USER="ubuntu",XAUTHORITY="/home/ubuntu/.Xauthority"
+      user=ubuntu
+      autostart=true
+      autorestart=false
+      priority=20
+      startsecs=4
+      stdout_logfile=/var/log/supervisor/xfce4.log
+      stderr_logfile=/var/log/supervisor/xfce4.err.log
+
+      [program:x11vnc]
+      command=/bin/bash -c "sleep 7 && /usr/bin/x11vnc -display :1 -rfbauth /home/ubuntu/.vnc/passwd -rfbport 5900 -forever -shared -noxdamage"
+      autostart=true
+      autorestart=true
+      priority=30
+      startsecs=2
+      stdout_logfile=/var/log/supervisor/x11vnc.log
+      stderr_logfile=/var/log/supervisor/x11vnc.err.log
+
+      [program:novnc]
+      command=/bin/bash -c "sleep 9 && /usr/bin/websockify --web=/usr/share/novnc 6080 localhost:5900"
+      autostart=true
+      autorestart=true
+      priority=40
+      startsecs=2
+      stdout_logfile=/var/log/supervisor/novnc.log
+      stderr_logfile=/var/log/supervisor/novnc.err.log
+
+runcmd:
+  # ── Install latest stable Go for linux/arm64 ─────────────────────────────
+  - |
+    GO_VER=$(curl -sSf 'https://go.dev/VERSION?m=text' | head -1 | tr -d '\r\n')
+    echo "Installing ${GO_VER} for linux/arm64..."
+    wget -q "https://go.dev/dl/${GO_VER}.linux-arm64.tar.gz" -O /tmp/go.tar.gz
+    tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm /tmp/go.tar.gz
+    ln -sf /usr/local/go/bin/go    /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+    echo "Go installed: $(/usr/local/go/bin/go version)"
+
+  # ── Add Go to ubuntu user's PATH ─────────────────────────────────────────
+  - echo 'export PATH=$PATH:/usr/local/go/bin'   >> /home/ubuntu/.bashrc
+  - echo 'export GOPATH=/home/ubuntu/go'          >> /home/ubuntu/.bashrc
+  - echo 'export PATH=$PATH:/home/ubuntu/go/bin'  >> /home/ubuntu/.bashrc
+
+  # ── VNC password (password: ubuntu) ─────────────────────────────────────
+  - mkdir -p /home/ubuntu/.vnc
+  - x11vnc -storepasswd ubuntu /home/ubuntu/.vnc/passwd
+  - chown -R ubuntu:ubuntu /home/ubuntu/.vnc
+
+  # ── Create XDG runtime dir for the ubuntu user ──────────────────────────
+  - mkdir -p /run/user/1000
+  - chown ubuntu:ubuntu /run/user/1000
+  - chmod 700 /run/user/1000
+
+  # ── Set ubuntu user password (needed to unlock XFCE4 screensaver) ──────────
+  - echo "ubuntu:ubuntu" | chpasswd
+
+  # ── Tune UDP buffers for QUIC performance ────────────────────────────────
+  # Without this, QUIC is ~10x slower than TCP in QEMU (default 208 KiB).
+  # 25 MB send/receive buffers bring UDP performance in line with TCP.
+  - sysctl -w net.core.rmem_max=26214400
+  - sysctl -w net.core.wmem_max=26214400
+  - sysctl -w net.core.rmem_default=212992
+  - sysctl -w net.core.wmem_default=212992
+  - sysctl -w net.core.netdev_max_backlog=5000
+  - sysctl -w net.ipv4.udp_mem="10240 87380 16777216"
+  - sysctl -w net.ipv4.udp_rmem_min=16384
+  - sysctl -w net.ipv4.udp_wmem_min=16384
+
+  # ── Enable + start supervisor (it will bring up the desktop stack) ───────
+  - systemctl enable supervisor
+  - systemctl start supervisor
