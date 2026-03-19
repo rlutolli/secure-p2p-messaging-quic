@@ -31,3 +31,5 @@ tls_keys.log
 
 # Log files
 *.log
+p2p-messenger
+*.json
