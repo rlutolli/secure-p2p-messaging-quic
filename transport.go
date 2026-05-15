@@ -28,7 +28,12 @@ func (w *QuicConnectionWrapper) Write(p []byte) (n int, err error) {
 }
 
 func (w *QuicConnectionWrapper) Close() error {
-	return w.Stream.Close()
+	serr := w.Stream.Close()
+	cerr := w.Conn.CloseWithError(0, "")
+	if serr != nil {
+		return serr
+	}
+	return cerr
 }
 
 func (w *QuicConnectionWrapper) RemoteAddr() net.Addr {

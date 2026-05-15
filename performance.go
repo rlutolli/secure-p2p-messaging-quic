@@ -27,10 +27,6 @@ const (
 	recommendedUDPBufSize = 7 * 1024 * 1024
 )
 
-func init() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-}
-
 func CheckUDPBuffers() {
 	switch runtime.GOOS {
 	case "linux":
