@@ -21,12 +21,13 @@ import (
 )
 
 type ConnectionManager struct {
-	mu          sync.RWMutex
-	connections map[string]*ManagedConnection
-	localPort   int
-	roomName    string
-	localAlias  string
-	useTCP      bool
+	mu           sync.RWMutex
+	connections  map[string]*ManagedConnection
+	localPort    int
+	roomName     string
+	localAlias   string
+	useTCP       bool
+	roomPassword string
 
 	sessionCache tls.ClientSessionCache
 
@@ -50,7 +51,7 @@ type ManagedConnection struct {
 	mu        sync.Mutex
 }
 
-func NewConnectionManager(localPort int, roomName string, useTCP bool) *ConnectionManager {
+func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassword string) *ConnectionManager {
 	cm := &ConnectionManager{
 		connections:      make(map[string]*ManagedConnection),
 		localPort:        localPort,
@@ -58,6 +59,7 @@ func NewConnectionManager(localPort int, roomName string, useTCP bool) *Connecti
 		localAlias:       generateAlias(),
 		seenMsgs:         make(map[string]time.Time),
 		useTCP:           useTCP,
+		roomPassword:     roomPassword,
 		sessionCache:     tls.NewLRUClientSessionCache(100),
 		tofuFingerprints: make(map[string]string),
 		pendingPings:     make(map[string]time.Time),
@@ -106,16 +108,17 @@ func (cm *ConnectionManager) healthCheck() {
 
 	for range ticker.C {
 		cm.mu.RLock()
-		addrs := make([]string, 0, len(cm.connections))
-		for addr := range cm.connections {
-			addrs = append(addrs, addr)
+		conns := make(map[string]*ManagedConnection, len(cm.connections))
+		for addr, mc := range cm.connections {
+			conns[addr] = mc
 		}
 		cm.mu.RUnlock()
 
 		var dead []string
+		var needPing []*ManagedConnection
 
 		cm.pendingPingsMu.Lock()
-		for _, addr := range addrs {
+		for addr, mc := range conns {
 			if sent, pending := cm.pendingPings[addr]; pending {
 				if time.Since(sent) > 10*time.Second {
 					dead = append(dead, addr)
@@ -123,19 +126,8 @@ func (cm *ConnectionManager) healthCheck() {
 				continue
 			}
 
-			cm.mu.RLock()
-			mc, ok := cm.connections[addr]
-			cm.mu.RUnlock()
-			if !ok {
-				continue
-			}
-
 			cm.pendingPings[addr] = time.Now()
-			go func(c *ManagedConnection) {
-				c.mu.Lock()
-				c.conn.Write([]byte("PING\n"))
-				c.mu.Unlock()
-			}(mc)
+			needPing = append(needPing, mc)
 		}
 		cm.pendingPingsMu.Unlock()
 
@@ -148,7 +140,27 @@ func (cm *ConnectionManager) healthCheck() {
 			fmt.Printf("\n%s\n> ", formatSystemMessage(addr+" disconnected (no response to ping)"))
 			cm.removeConnection(addr)
 		}
+
+		for _, mc := range needPing {
+			go func(c *ManagedConnection, addr string) {
+				c.mu.Lock()
+				_, err := c.conn.Write([]byte("PING\n"))
+				c.mu.Unlock()
+				if err != nil {
+					cm.pendingPingsMu.Lock()
+					delete(cm.pendingPings, addr)
+					cm.pendingPingsMu.Unlock()
+					cm.removeConnection(addr)
+				}
+			}(mc, mc.peerAddr)
+		}
 	}
+}
+
+func (cm *ConnectionManager) ClearPing(addr string) {
+	cm.pendingPingsMu.Lock()
+	delete(cm.pendingPings, addr)
+	cm.pendingPingsMu.Unlock()
 }
 
 func (cm *ConnectionManager) GetLocalAlias() string {
@@ -245,7 +257,12 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 		}
 	}
 
-	handshake := fmt.Sprintf("JOIN:%s|%s\n", cm.roomName, cm.localAlias)
+	var handshake string
+	if cm.roomPassword != "" {
+		handshake = fmt.Sprintf("JOIN:%s|%s|%s\n", cm.roomName, cm.localAlias, cm.roomPassword)
+	} else {
+		handshake = fmt.Sprintf("JOIN:%s|%s\n", cm.roomName, cm.localAlias)
+	}
 	if _, err := pc.Write([]byte(handshake)); err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
@@ -284,9 +301,7 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			mc.mu.Lock()
 			mc.lastUsed = time.Now()
 			mc.mu.Unlock()
-			cm.pendingPingsMu.Lock()
-			delete(cm.pendingPings, mc.peerAddr)
-			cm.pendingPingsMu.Unlock()
+			cm.ClearPing(mc.peerAddr)
 			continue
 		}
 
@@ -295,6 +310,16 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			mc.conn.Write([]byte("PONG\n"))
 			mc.mu.Unlock()
 			continue
+		}
+
+		if strings.HasPrefix(line, "AUTH:FAILED") {
+			reason := strings.TrimPrefix(line, "AUTH:FAILED|")
+			if reason == "" {
+				reason = "Authentication failed"
+			}
+			fmt.Printf("\n%s\n> ", formatSystemMessage("Authentication failed: "+reason))
+			cm.removeConnection(mc.peerAddr)
+			return
 		}
 
 		var formatted string
@@ -332,19 +357,31 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 	}
 }
 
-func (cm *ConnectionManager) removeConnection(peerAddr string) {
+func (cm *ConnectionManager) removeConnection(peerAddr string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	found := false
 	if mc, exists := cm.connections[peerAddr]; exists {
 		mc.conn.Close()
 		delete(cm.connections, peerAddr)
+		found = true
 	}
+
+	cm.pendingPingsMu.Lock()
+	delete(cm.pendingPings, peerAddr)
+	cm.pendingPingsMu.Unlock()
+
+	return found
 }
 
 func (cm *ConnectionManager) Send(ctx context.Context, peerAddr, message string) error {
 	mc, err := cm.getOrCreate(ctx, peerAddr)
 	if err != nil {
+		return err
+	}
+
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 

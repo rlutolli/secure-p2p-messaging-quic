@@ -71,6 +71,7 @@ type App struct {
 	discovery     *DiscoveryService
 	connManager   *ConnectionManager
 	roomName      string
+	roomPassword  string
 	isPrivate     bool
 	useTCP        bool
 	rendezvousURL string
@@ -128,7 +129,7 @@ func main() {
 
 	fmt.Printf("Secure P2P Messenger (v0.4 — TCP: %v)\n", useTCP)
 
-	done := make(chan bool)
+	done := make(chan bool, 1)
 	go runSpinner(done, "Scanning LAN for rooms")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -140,13 +141,18 @@ func main() {
 	fmt.Println()
 
 	var roomName string
+	var roomPassword string
 	var isPrivate bool
 	var peersToConnect []string
 
 	if len(rooms) > 0 {
 		fmt.Println("\nAvailable rooms:")
 		for i, room := range rooms {
-			fmt.Printf("  %s%d%s. %s (%d peer(s))\n", colorCyan, i+1, colorReset, room.Name, len(room.Peers))
+			indicator := ""
+			if room.HasPassword {
+				indicator = " [password protected]"
+			}
+			fmt.Printf("  %s%d%s. %s (%d peer(s))%s\n", colorCyan, i+1, colorReset, room.Name, len(room.Peers), indicator)
 		}
 		fmt.Println("  n. Create new room")
 		fmt.Println("  p. Private mode (hidden)")
@@ -164,6 +170,9 @@ func main() {
 				roomName = "default"
 			}
 			isPrivate = false
+			fmt.Print("Set a password? (leave empty for none): ")
+			password, _ := reader.ReadString('\n')
+			roomPassword = strings.TrimSpace(password)
 		case "p", "P":
 			roomName = "private"
 			isPrivate = true
@@ -173,6 +182,11 @@ func main() {
 				roomName = rooms[idx-1].Name
 				peersToConnect = rooms[idx-1].Peers
 				isPrivate = false
+				if rooms[idx-1].HasPassword {
+					fmt.Print("Enter room password: ")
+					password, _ := reader.ReadString('\n')
+					roomPassword = strings.TrimSpace(password)
+				}
 			} else {
 				roomName = choice
 				isPrivate = false
@@ -197,7 +211,7 @@ func main() {
 		}
 	}
 
-	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL)
+	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword)
 	if err != nil {
 		fmt.Printf("Failed to start: %v\n", err)
 		os.Exit(1)
@@ -256,15 +270,16 @@ func main() {
 	app.runCLI()
 }
 
-func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string) (*App, error) {
+func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string) (*App, error) {
 	app := &App{
 		roomName:      roomName,
+		roomPassword:  roomPassword,
 		isPrivate:     isPrivate,
 		useTCP:        useTCP,
 		rendezvousURL: rendezvousURL,
 	}
 
-	app.connManager = NewConnectionManager(0, roomName, useTCP)
+	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword)
 
 	onMessage := func(from, room, message string) {
 		fmt.Printf("\n%s\n> ", formatMessage(from, message))
@@ -285,7 +300,7 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 	if !isPrivate {
 		time.Sleep(200 * time.Millisecond)
 
-		discovery, err := NewDiscoveryService(server.Port(), roomName, discPort)
+		discovery, err := NewDiscoveryService(server.Port(), roomName, discPort, func() bool { return app.roomPassword != "" })
 		if err != nil {
 			server.Close()
 			return nil, fmt.Errorf("discovery start failed: %w", err)
@@ -300,6 +315,7 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 
 func (app *App) runCLI() {
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	fmt.Print("> ")
 
 	noArgCommands := map[string]bool{
@@ -372,6 +388,10 @@ func (app *App) runCLI() {
 		}
 
 		fmt.Print("> ")
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("\nInput error: %v\n", err)
 	}
 }
 

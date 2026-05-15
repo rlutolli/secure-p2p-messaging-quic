@@ -15,6 +15,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
 
 var globalKeyLog io.WriteCloser
@@ -105,6 +107,10 @@ type RoomCrypto struct {
 	roomKey []byte
 }
 
-func DeriveRoomKey(roomName, password string) (*RoomCrypto, error) {
-	return &RoomCrypto{}, nil
+func DeriveRoomKey(roomName, password string) *RoomCrypto {
+	if password == "" {
+		return &RoomCrypto{roomKey: nil}
+	}
+	key := argon2.IDKey([]byte(password), []byte(roomName), 1, 64*1024, 4, 32)
+	return &RoomCrypto{roomKey: key}
 }

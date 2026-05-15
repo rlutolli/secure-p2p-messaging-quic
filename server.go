@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"crypto/subtle"
 	"crypto/tls"
 
 	"github.com/quic-go/quic-go"
@@ -39,9 +40,10 @@ type Server struct {
 }
 
 type Room struct {
-	name    string
-	peers   map[string]*Peer
-	peersMu sync.RWMutex
+	name         string
+	passwordHash string
+	peers        map[string]*Peer
+	peersMu      sync.RWMutex
 }
 
 type Peer struct {
@@ -186,17 +188,43 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 		return
 	}
 	if message == "PONG" {
+		if s.connManager != nil {
+			s.connManager.ClearPing(peer.addr)
+		}
 		return
 	}
 
 	if strings.HasPrefix(message, "JOIN:") {
 		payload := strings.TrimPrefix(message, "JOIN:")
-		parts := strings.SplitN(payload, "|", 2)
+		parts := strings.SplitN(payload, "|", 3)
 		roomName := parts[0]
-		if len(parts) == 2 && parts[1] != "" {
+		if len(parts) >= 2 && parts[1] != "" {
 			peer.alias = parts[1]
 		}
-		s.joinRoom(peer, roomName)
+		var providedPassword string
+		if len(parts) == 3 {
+			providedPassword = parts[2]
+		}
+
+		s.roomsMu.RLock()
+		room, exists := s.rooms[roomName]
+		s.roomsMu.RUnlock()
+
+		passwordHash := ""
+		if providedPassword != "" {
+			derived := DeriveRoomKey(roomName, providedPassword)
+			if exists && room.passwordHash != "" {
+				if subtle.ConstantTimeCompare([]byte(room.passwordHash), derived.roomKey) != 1 {
+					peer.conn.Write([]byte("AUTH:FAILED|Incorrect password\n"))
+					s.removePeer(peer)
+					return
+				}
+			} else {
+				passwordHash = string(derived.roomKey)
+			}
+		}
+
+		s.joinRoom(peer, roomName, passwordHash)
 		return
 	}
 
@@ -233,13 +261,14 @@ func (s *Server) handleMessage(peer *Peer, message string) {
 	}
 }
 
-func (s *Server) joinRoom(peer *Peer, roomName string) {
+func (s *Server) joinRoom(peer *Peer, roomName string, passwordHash string) {
 	s.roomsMu.Lock()
 	room, exists := s.rooms[roomName]
 	if !exists {
 		room = &Room{
-			name:  roomName,
-			peers: make(map[string]*Peer),
+			name:         roomName,
+			passwordHash: passwordHash,
+			peers:        make(map[string]*Peer),
 		}
 		s.rooms[roomName] = room
 	}
@@ -306,14 +335,25 @@ func (s *Server) broadcastToRoom(room *Room, senderAddr, message string) {
 
 func (s *Server) removePeer(peer *Peer) {
 	if peer.room != nil {
+		var roomName string
 		peer.room.peersMu.Lock()
 		delete(peer.room.peers, peer.addr)
 		empty := len(peer.room.peers) == 0
+		if empty {
+			roomName = peer.room.name
+		}
 		peer.room.peersMu.Unlock()
 
-		if empty {
+		if empty && roomName != "" {
 			s.roomsMu.Lock()
-			delete(s.rooms, peer.room.name)
+			if room, exists := s.rooms[roomName]; exists {
+				room.peersMu.RLock()
+				stillEmpty := len(room.peers) == 0
+				room.peersMu.RUnlock()
+				if stillEmpty {
+					delete(s.rooms, roomName)
+				}
+			}
 			s.roomsMu.Unlock()
 		}
 
@@ -326,7 +366,13 @@ func (s *Server) removePeer(peer *Peer) {
 
 		log.Printf("[Server] Peer %s left room '%s'", peer.addr, peer.room.name)
 	}
-	peer.conn.Close()
+	if s.connManager != nil {
+		if !s.connManager.removeConnection(peer.addr) {
+			peer.conn.Close()
+		}
+	} else {
+		peer.conn.Close()
+	}
 }
 
 func (s *Server) Close() error {
