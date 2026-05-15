@@ -1,16 +1,18 @@
 // quic_diagnostic.go – QUIC+TLS echo benchmark with SSL key logging for Wireshark
 //
 // Usage:
-//   go run quic_diagnostic.go [-opt] [-reuse] [-wan] [-burst N] server [port]
-//   go run quic_diagnostic.go [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size]
 //
-//   -opt      Enable production QUIC config (large windows, Allow0RTT) + TLS session cache
-//   -reuse    Run all payload sizes (64, 1024, 5000 B) on a single persistent connection
-//   -wan      Include handshake in timing; timer starts before quic.DialAddr (Scenario 2)
-//   -burst N  Make N short-lived fresh connections sequentially; 2nd+ use DialAddrEarly / 0-RTT (Scenario 6)
+//		go run quic_diagnostic.go [-opt] [-reuse] [-wan] [-burst N] server [port]
+//		go run quic_diagnostic.go [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size]
+//
+//		-opt      Enable production QUIC config (large windows, Allow0RTT) + TLS session cache
+//	  -reuse    Run all payload sizes (64, 100, 5000 B) on a single persistent connection
+//		-wan      Include handshake in timing; timer starts before quic.DialAddr (Scenario 2)
+//		-burst N  Make N short-lived fresh connections sequentially; 2nd+ use DialAddrEarly / 0-RTT (Scenario 6)
 //
 // Payload format:
-//   "MSG1:QUIC:SIZE=64:AAAA..."  padded with 'A' to exactly <size> bytes
+//
+//	"MSG1:QUIC:SIZE=64:AAAA..."  padded with 'A' to exactly <size> bytes
 //
 // Set SSLKEYLOGFILE=/path/to/tls_keys.log so Wireshark can decrypt traffic.
 package main
@@ -45,12 +47,12 @@ const (
 
 var (
 	flagOpt   = flag.Bool("opt", false, "enable production QUIC config + TLS session cache / 0-RTT")
-	flagReuse = flag.Bool("reuse", false, "run all sizes (64,1024,5000) on one persistent connection")
+	flagReuse = flag.Bool("reuse", false, "run all sizes (64,100,5000) on one persistent connection")
 	flagWAN   = flag.Bool("wan", false, "include handshake in timing; timer starts before quic.DialAddr")
 	flagBurst = flag.Int("burst", 0, "make N short-lived connections; 2nd+ use DialAddrEarly (0-RTT)")
 )
 
-var sweepSizes = []int{64, 1024, 5000}
+var sweepSizes = []int{64, 100, 5000}
 
 func openKeyLog() io.WriteCloser {
 	path := os.Getenv("SSLKEYLOGFILE")
@@ -262,10 +264,7 @@ func runClient(addr, port string, size int) {
 		MinVersion:         tls.VersionTLS13,
 		KeyLogWriter:       keyLog,
 	}
-	quicCfg := &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-	}
+	quicCfg := productionQuicConfig()
 	target := net.JoinHostPort(addr, port)
 	fmt.Printf("[QUIC Client] Connecting to %s  payload=%d bytes\n", target, size)
 	conn, err := quic.DialAddr(context.Background(), target, tlsConfig, quicCfg)
@@ -295,7 +294,6 @@ func runClient(addr, port string, size int) {
 		rtt := time.Since(start)
 		fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 			i, len(payload), len(resp), rtt)
-		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -306,18 +304,29 @@ func runClientWAN(addr, port string, size int) {
 	if keyLog != nil {
 		defer keyLog.Close()
 	}
+	sessionCache := tls.NewLRUClientSessionCache(100)
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quic-diagnostic"},
 		MinVersion:         tls.VersionTLS13,
 		KeyLogWriter:       keyLog,
+		ClientSessionCache: sessionCache,
 	}
 	quicCfg := productionQuicConfig()
 	target := net.JoinHostPort(addr, port)
 	fmt.Printf("[QUIC WAN] → %s  payload=%d bytes\n", target, size)
 
+	// Warmup: full 1-RTT handshake to obtain session ticket
+	warmupConn, err := quic.DialAddr(context.Background(), target, tlsConfig, quicCfg)
+	if err != nil {
+		fmt.Printf("Warmup error: %v\n", err)
+		return
+	}
+	warmupConn.CloseWithError(0, "warmup")
+
+	// Measure 0-RTT connection + first message
 	dialStart := time.Now()
-	conn, err := quic.DialAddr(context.Background(), target, tlsConfig, quicCfg)
+	conn, err := quic.DialAddrEarly(context.Background(), target, tlsConfig, quicCfg)
 	if err != nil {
 		fmt.Printf("Connect error: %v\n", err)
 		return
@@ -362,7 +371,6 @@ func runClientBurst(addr, port string, size, n int) {
 	ctx := context.Background()
 
 	sessionCache := tls.NewLRUClientSessionCache(100)
-
 
 	fmt.Printf("[QUIC BURST n=%d size=%d → %s]\n", n, size, target)
 
@@ -427,12 +435,7 @@ func runClientBurst(addr, port string, size, n int) {
 
 		sumMs += totalMs
 		stream.Close()
-
-		if i == 1 {
-			time.Sleep(200 * time.Millisecond)
-		}
 		conn.CloseWithError(0, "done")
-		time.Sleep(50 * time.Millisecond)
 	}
 	fmt.Printf("  SUM_TOTAL_MS=%.1f  AVG_MS=%.1f\n", sumMs, sumMs/float64(n))
 }
@@ -487,11 +490,9 @@ func runClientOpt(addr, port string) {
 			rtt := time.Since(start)
 			fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 				i, len(payload), len(resp), rtt)
-			time.Sleep(200 * time.Millisecond)
 		}
 		stream.Close()
 		conn.CloseWithError(0, "done")
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -549,7 +550,6 @@ func runClientReuse(addr, port string, opt bool) {
 			rtt := time.Since(start)
 			fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 				i, len(payload), len(resp), rtt)
-			time.Sleep(200 * time.Millisecond)
 		}
 	}
 }

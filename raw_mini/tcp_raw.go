@@ -1,16 +1,18 @@
 // tcp_raw.go – TCP+TLS echo benchmark with SSL key logging for Wireshark
 //
 // Usage:
-//   go run tcp_raw.go [-opt] [-reuse] [-wan] [-burst N] server [port]
-//   go run tcp_raw.go [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size]
 //
-//   -opt      Enable optimisations: TCP_NODELAY + TLS session cache
-//   -reuse    Run all payload sizes (64, 1024, 5000 B) on a single persistent connection
-//   -wan      Include handshake in timing; timer starts before tls.Dial (Scenario 2)
-//   -burst N  Make N short-lived fresh connections sequentially (Scenario 6)
+//		go run tcp_raw.go [-opt] [-reuse] [-wan] [-burst N] server [port]
+//		go run tcp_raw.go [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size]
+//
+//		-opt      Enable optimisations: TCP_NODELAY + TLS session cache
+//	  -reuse    Run all payload sizes (64, 100, 5000 B) on a single persistent connection
+//		-wan      Include handshake in timing; timer starts before tls.Dial (Scenario 2)
+//		-burst N  Make N short-lived fresh connections sequentially (Scenario 6)
 //
 // Payload format:
-//   "MSG1:TCP:SIZE=64:AAAA..."   padded with 'A' to exactly <size> bytes
+//
+//	"MSG1:TCP:SIZE=64:AAAA..."   padded with 'A' to exactly <size> bytes
 //
 // Set SSLKEYLOGFILE=/path/to/tls_keys.log so Wireshark can decrypt traffic.
 package main
@@ -42,12 +44,12 @@ const (
 
 var (
 	flagOpt   = flag.Bool("opt", false, "enable optimisations: TCP_NODELAY + TLS session cache")
-	flagReuse = flag.Bool("reuse", false, "run all sizes (64,1024,5000) on one persistent connection")
+	flagReuse = flag.Bool("reuse", false, "run all sizes (64,100,5000) on one persistent connection")
 	flagWAN   = flag.Bool("wan", false, "include handshake in timing; timer starts before tls.Dial")
 	flagBurst = flag.Int("burst", 0, "make N short-lived connections sequentially (reconnect scenario)")
 )
 
-var sweepSizes = []int{64, 1024, 5000}
+var sweepSizes = []int{64, 100, 5000}
 
 func openKeyLog() io.WriteCloser {
 	path := os.Getenv("SSLKEYLOGFILE")
@@ -125,7 +127,7 @@ func main() {
 	args := flag.Args()
 	if len(args) < 1 {
 		fmt.Println("Usage: tcp_raw [-opt] [-reuse] [-wan] [-burst N] server [port]")
-		fmt.Println("       tcp_raw [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size]")
+		fmt.Println("       tcp_raw [-opt] [-reuse] [-wan] [-burst N] client [addr] [port] [size] [msgs]")
 		os.Exit(1)
 	}
 
@@ -141,6 +143,7 @@ func main() {
 		addr := "127.0.0.1"
 		port := DefaultPort
 		size := 64
+		msgs := 10
 		if len(args) >= 2 {
 			addr = args[1]
 		}
@@ -155,6 +158,14 @@ func main() {
 			}
 			size = n
 		}
+		if len(args) >= 5 {
+			n, err := strconv.Atoi(args[4])
+			if err != nil || n < 1 {
+				fmt.Printf("Invalid msgs %q\n", args[4])
+				os.Exit(1)
+			}
+			msgs = n
+		}
 
 		switch {
 		case *flagBurst > 0:
@@ -162,11 +173,11 @@ func main() {
 		case *flagWAN:
 			runClientWAN(addr, port, size)
 		case *flagReuse:
-			runClientReuse(addr, port, *flagOpt)
+			runClientReuse(addr, port, *flagOpt, msgs)
 		case *flagOpt:
-			runClientOpt(addr, port)
+			runClientOpt(addr, port, msgs)
 		default:
-			runClient(addr, port, size)
+			runClient(addr, port, size, msgs)
 		}
 
 	default:
@@ -221,7 +232,7 @@ func handleConnection(conn net.Conn) {
 
 // ─── Client: Scenario A – vanilla, fresh connection ──────────────────────────
 
-func runClient(addr, port string, size int) {
+func runClient(addr, port string, size int, msgs int) {
 	keyLog := openKeyLog()
 	if keyLog != nil {
 		defer keyLog.Close()
@@ -239,7 +250,7 @@ func runClient(addr, port string, size int) {
 		return
 	}
 	defer conn.Close()
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= msgs; i++ {
 		payload := []byte(makePayload(i, size))
 		start := time.Now()
 		if err := writeMsg(conn, payload); err != nil {
@@ -254,7 +265,7 @@ func runClient(addr, port string, size int) {
 		rtt := time.Since(start)
 		fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 			i, len(payload), len(resp), rtt)
-		time.Sleep(200 * time.Millisecond)
+		// delay removed
 	}
 }
 
@@ -311,7 +322,6 @@ func runClientBurst(addr, port string, size, n int) {
 
 	sessionCache := tls.NewLRUClientSessionCache(100)
 
-
 	fmt.Printf("[TCP BURST n=%d size=%d → %s]\n", n, size, target)
 
 	var sumMs float64
@@ -353,14 +363,13 @@ func runClientBurst(addr, port string, size, n int) {
 
 		sumMs += totalMs
 		conn.Close()
-		time.Sleep(50 * time.Millisecond)
 	}
 	fmt.Printf("  SUM_TOTAL_MS=%.1f  AVG_MS=%.1f\n", sumMs, sumMs/float64(n))
 }
 
 // ─── Client: -opt – fresh connection per size, shared session cache ───────────
 
-func runClientOpt(addr, port string) {
+func runClientOpt(addr, port string, msgs int) {
 	keyLog := openKeyLog()
 	if keyLog != nil {
 		defer keyLog.Close()
@@ -384,7 +393,7 @@ func runClientOpt(addr, port string) {
 		if tc, ok := conn.NetConn().(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
-		for i := 1; i <= 10; i++ {
+		for i := 1; i <= msgs; i++ {
 			payload := []byte(makePayload(i, size))
 			start := time.Now()
 			if err := writeMsg(conn, payload); err != nil {
@@ -401,16 +410,15 @@ func runClientOpt(addr, port string) {
 			rtt := time.Since(start)
 			fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 				i, len(payload), len(resp), rtt)
-			time.Sleep(200 * time.Millisecond)
+			// delay removed
 		}
 		conn.Close()
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
 // ─── Client: -reuse – one persistent connection for all sizes ────────────────
 
-func runClientReuse(addr, port string, opt bool) {
+func runClientReuse(addr, port string, opt bool, msgs int) {
 	keyLog := openKeyLog()
 	if keyLog != nil {
 		defer keyLog.Close()
@@ -438,7 +446,7 @@ func runClientReuse(addr, port string, opt bool) {
 	}
 	for _, size := range sweepSizes {
 		fmt.Printf("\n=== SIZE %d ===\n", size)
-		for i := 1; i <= 10; i++ {
+		for i := 1; i <= msgs; i++ {
 			payload := []byte(makePayload(i, size))
 			start := time.Now()
 			if err := writeMsg(conn, payload); err != nil {
@@ -453,7 +461,7 @@ func runClientReuse(addr, port string, opt bool) {
 			rtt := time.Since(start)
 			fmt.Printf("  [%d] sent=%d bytes  response=%d bytes  RTT=%v\n",
 				i, len(payload), len(resp), rtt)
-			time.Sleep(200 * time.Millisecond)
+			// delay removed
 		}
 	}
 }
