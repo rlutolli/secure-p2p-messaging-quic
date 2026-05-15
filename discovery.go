@@ -19,28 +19,31 @@ var broadcastAddresses = []string{
 }
 
 type DiscoveryMessage struct {
-	Type    string `json:"type"`
-	Room    string `json:"room"`
-	Port    int    `json:"port"`
-	Version string `json:"version"`
+	Type        string `json:"type"`
+	Room        string `json:"room"`
+	Port        int    `json:"port"`
+	Version     string `json:"version"`
+	HasPassword bool   `json:"has_password,omitempty"`
 }
 
 type DiscoveryService struct {
-	roomName   string
-	localPort  int
-	conn       *net.UDPConn
-	peers      map[string]time.Time
-	peersMu    sync.RWMutex
-	stopCh     chan struct{}
-	localAddrs map[string]bool
+	roomName    string
+	localPort   int
+	conn        *net.UDPConn
+	peers       map[string]time.Time
+	peersMu     sync.RWMutex
+	stopCh      chan struct{}
+	localAddrs  map[string]bool
+	hasPassword func() bool
 }
 
 type RoomInfo struct {
-	Name  string
-	Peers []string
+	Name        string
+	Peers       []string
+	HasPassword bool
 }
 
-func NewDiscoveryService(port int, roomName string, discPort int) (*DiscoveryService, error) {
+func NewDiscoveryService(port int, roomName string, discPort int, hasPassword func() bool) (*DiscoveryService, error) {
 	discoveryPort = discPort
 
 	lc := net.ListenConfig{
@@ -51,7 +54,7 @@ func NewDiscoveryService(port int, roomName string, discPort int) (*DiscoverySer
 					opErr = err
 					return
 				}
-				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+				opErr = setReusePort(int(fd))
 			})
 			return opErr
 		},
@@ -66,12 +69,13 @@ func NewDiscoveryService(port int, roomName string, discPort int) (*DiscoverySer
 	conn.SetReadBuffer(65535)
 
 	ds := &DiscoveryService{
-		roomName:   roomName,
-		localPort:  port,
-		conn:       conn,
-		peers:      make(map[string]time.Time),
-		stopCh:     make(chan struct{}),
-		localAddrs: getLocalAddrsMap(port),
+		roomName:    roomName,
+		localPort:   port,
+		conn:        conn,
+		peers:       make(map[string]time.Time),
+		stopCh:      make(chan struct{}),
+		localAddrs:  getLocalAddrsMap(port),
+		hasPassword: hasPassword,
 	}
 
 	go ds.listenLoop()
@@ -86,9 +90,15 @@ func getLocalAddrsMap(port int) map[string]bool {
 	addrs := make(map[string]bool)
 	addrs[fmt.Sprintf("127.0.0.1:%d", port)] = true
 
-	ifaces, _ := net.Interfaces()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return addrs
+	}
 	for _, iface := range ifaces {
-		ifAddrs, _ := iface.Addrs()
+		ifAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
 		for _, addr := range ifAddrs {
 			if ipnet, ok := addr.(*net.IPNet); ok {
 				if ipv4 := ipnet.IP.To4(); ipv4 != nil {
@@ -173,19 +183,21 @@ func (ds *DiscoveryService) announceLoop() {
 
 func (ds *DiscoveryService) announce() {
 	ds.sendBroadcast(DiscoveryMessage{
-		Type:    "announce",
-		Room:    ds.roomName,
-		Port:    ds.localPort,
-		Version: "0.4",
+		Type:        "announce",
+		Room:        ds.roomName,
+		Port:        ds.localPort,
+		Version:     "0.4",
+		HasPassword: ds.hasPassword(),
 	})
 }
 
 func (ds *DiscoveryService) announceToAddr(addr *net.UDPAddr) {
 	msg := DiscoveryMessage{
-		Type:    "announce",
-		Room:    ds.roomName,
-		Port:    ds.localPort,
-		Version: "0.4",
+		Type:        "announce",
+		Room:        ds.roomName,
+		Port:        ds.localPort,
+		Version:     "0.4",
+		HasPassword: ds.hasPassword(),
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -250,6 +262,7 @@ func DiscoverAllRooms(ctx context.Context, discPort int) ([]RoomInfo, error) {
 	defer conn.Close()
 
 	roomsMap := make(map[string]map[string]bool)
+	roomHasPassword := make(map[string]bool)
 
 	queryMsg := DiscoveryMessage{
 		Type:    "query",
@@ -295,6 +308,7 @@ func DiscoverAllRooms(ctx context.Context, discPort int) ([]RoomInfo, error) {
 			roomsMap[msg.Room] = make(map[string]bool)
 		}
 		roomsMap[msg.Room][peerAddr] = true
+		roomHasPassword[msg.Room] = msg.HasPassword
 	}
 
 done:
@@ -304,7 +318,7 @@ done:
 		for peer := range peersSet {
 			peers = append(peers, peer)
 		}
-		rooms = append(rooms, RoomInfo{Name: roomName, Peers: deduplicatePeers(peers)})
+		rooms = append(rooms, RoomInfo{Name: roomName, Peers: deduplicatePeers(peers), HasPassword: roomHasPassword[roomName]})
 	}
 	return rooms, nil
 }
