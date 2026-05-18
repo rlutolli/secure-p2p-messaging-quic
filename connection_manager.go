@@ -41,6 +41,9 @@ type ConnectionManager struct {
 
 	pendingPingsMu sync.Mutex
 	pendingPings   map[string]time.Time
+
+	relayAddrs map[string]bool
+	relayMu    sync.RWMutex
 }
 
 type ManagedConnection struct {
@@ -51,7 +54,7 @@ type ManagedConnection struct {
 	mu        sync.Mutex
 }
 
-func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassword string) *ConnectionManager {
+func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassword string, isRelay bool) *ConnectionManager {
 	cm := &ConnectionManager{
 		connections:      make(map[string]*ManagedConnection),
 		localPort:        localPort,
@@ -63,6 +66,7 @@ func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassw
 		sessionCache:     tls.NewLRUClientSessionCache(100),
 		tofuFingerprints: make(map[string]string),
 		pendingPings:     make(map[string]time.Time),
+		relayAddrs:       make(map[string]bool),
 	}
 
 	go cm.cleanupSeenMsgs()
@@ -165,6 +169,28 @@ func (cm *ConnectionManager) ClearPing(addr string) {
 
 func (cm *ConnectionManager) GetLocalAlias() string {
 	return cm.localAlias
+}
+
+func (cm *ConnectionManager) MarkRelay(addr string) {
+	cm.relayMu.Lock()
+	defer cm.relayMu.Unlock()
+	cm.relayAddrs[addr] = true
+}
+
+func (cm *ConnectionManager) IsRelayPeer(addr string) bool {
+	cm.relayMu.RLock()
+	defer cm.relayMu.RUnlock()
+	return cm.relayAddrs[addr]
+}
+
+func (cm *ConnectionManager) GetRelayAddrs() []string {
+	cm.relayMu.RLock()
+	defer cm.relayMu.RUnlock()
+	addrs := make([]string, 0, len(cm.relayAddrs))
+	for addr := range cm.relayAddrs {
+		addrs = append(addrs, addr)
+	}
+	return addrs
 }
 
 func (cm *ConnectionManager) GetOrCreate(ctx context.Context, peerAddr string) (*ManagedConnection, error) {
