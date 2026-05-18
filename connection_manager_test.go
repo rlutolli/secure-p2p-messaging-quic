@@ -24,7 +24,7 @@ func TestConnectionManagerIsDuplicate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cm := NewConnectionManager(0, "testroom", true, "")
+			cm := NewConnectionManager(0, "testroom", true, "", false)
 			tt.setup(cm)
 			got := cm.IsDuplicate(tt.sender, tt.message)
 			if got != tt.want {
@@ -36,7 +36,7 @@ func TestConnectionManagerIsDuplicate(t *testing.T) {
 
 func TestConnectionManagerIsDuplicateExpires(t *testing.T) {
 	t.Parallel()
-	cm := NewConnectionManager(0, "testroom", true, "")
+	cm := NewConnectionManager(0, "testroom", true, "", false)
 
 	if cm.IsDuplicate("alice", "hello") {
 		t.Fatal("expected first message not duplicate")
@@ -56,7 +56,7 @@ func TestConnectionManagerIsDuplicateExpires(t *testing.T) {
 
 func TestConnectionManagerListConnected(t *testing.T) {
 	t.Parallel()
-	cm := NewConnectionManager(0, "testroom", true, "")
+	cm := NewConnectionManager(0, "testroom", true, "", false)
 
 	addr := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
 	mock := newMockConn(&addr)
@@ -74,7 +74,7 @@ func TestConnectionManagerListConnected(t *testing.T) {
 
 func TestConnectionManagerRegisterIncomingDedupes(t *testing.T) {
 	t.Parallel()
-	cm := NewConnectionManager(0, "testroom", true, "")
+	cm := NewConnectionManager(0, "testroom", true, "", false)
 
 	addr1 := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
 	mock1 := newMockConn(&addr1)
@@ -91,7 +91,7 @@ func TestConnectionManagerRegisterIncomingDedupes(t *testing.T) {
 
 func TestConnectionManagerRemoveConnection(t *testing.T) {
 	t.Parallel()
-	cm := NewConnectionManager(0, "testroom", true, "")
+	cm := NewConnectionManager(0, "testroom", true, "", false)
 
 	addr := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
 	mock := newMockConn(&addr)
@@ -110,7 +110,7 @@ func TestConnectionManagerRemoveConnection(t *testing.T) {
 
 func TestConnectionManagerSend(t *testing.T) {
 	t.Parallel()
-	cm := NewConnectionManager(0, "testroom", true, "")
+	cm := NewConnectionManager(0, "testroom", true, "", false)
 
 	addr := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
 	mock := newMockConn(&addr)
@@ -129,5 +129,53 @@ func TestConnectionManagerSend(t *testing.T) {
 	expected := "FROM:" + cm.GetLocalAlias() + "|hello world\n"
 	if string(written) != expected {
 		t.Errorf("expected %q, got %q", expected, string(written))
+	}
+}
+
+func TestConnectionManagerRelayTracking(t *testing.T) {
+	t.Parallel()
+	cm := NewConnectionManager(0, "testroom", true, "", false)
+
+	if cm.IsRelayPeer("127.0.0.1:1111") {
+		t.Error("expected no relay peers initially")
+	}
+
+	cm.MarkRelay("127.0.0.1:1111")
+	if !cm.IsRelayPeer("127.0.0.1:1111") {
+		t.Error("expected 127.0.0.1:1111 to be a relay peer")
+	}
+
+	addrs := cm.GetRelayAddrs()
+	if len(addrs) != 1 || addrs[0] != "127.0.0.1:1111" {
+		t.Errorf("expected [127.0.0.1:1111], got %v", addrs)
+	}
+}
+
+func TestConnectionManagerNonRelayOnlySendsToRelay(t *testing.T) {
+	t.Parallel()
+	cm := NewConnectionManager(0, "testroom", true, "", false)
+
+	addr1 := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111}
+	mock1 := newMockConn(&addr1)
+	cm.RegisterIncoming("127.0.0.1:1111", mock1)
+	cm.MarkRelay("127.0.0.1:1111")
+
+	addr2 := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222}
+	mock2 := newMockConn(&addr2)
+	cm.RegisterIncoming("127.0.0.1:2222", mock2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	relays := cm.GetRelayAddrs()
+	for _, addr := range relays {
+		cm.Send(ctx, addr, "hello")
+	}
+
+	if len(mock1.getWritten()) == 0 {
+		t.Error("expected relay peer to receive message")
+	}
+	if len(mock2.getWritten()) != 0 {
+		t.Error("expected non-relay peer not to receive message")
 	}
 }

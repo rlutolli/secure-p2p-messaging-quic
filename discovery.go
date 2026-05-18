@@ -24,26 +24,31 @@ type DiscoveryMessage struct {
 	Port        int    `json:"port"`
 	Version     string `json:"version"`
 	HasPassword bool   `json:"has_password,omitempty"`
+	IsRelay     bool   `json:"is_relay,omitempty"`
 }
 
 type DiscoveryService struct {
-	roomName    string
-	localPort   int
-	conn        *net.UDPConn
-	peers       map[string]time.Time
-	peersMu     sync.RWMutex
-	stopCh      chan struct{}
-	localAddrs  map[string]bool
-	hasPassword func() bool
+	roomName     string
+	localPort    int
+	conn         *net.UDPConn
+	peers        map[string]time.Time
+	peersMu      sync.RWMutex
+	stopCh       chan struct{}
+	localAddrs   map[string]bool
+	hasPassword  func() bool
+	isRelay      func() bool
+	relayPeers   map[string]time.Time
+	relayPeersMu sync.RWMutex
 }
 
 type RoomInfo struct {
 	Name        string
 	Peers       []string
 	HasPassword bool
+	IsRelay     bool
 }
 
-func NewDiscoveryService(port int, roomName string, discPort int, hasPassword func() bool) (*DiscoveryService, error) {
+func NewDiscoveryService(port int, roomName string, discPort int, hasPassword func() bool, isRelay func() bool) (*DiscoveryService, error) {
 	discoveryPort = discPort
 
 	lc := net.ListenConfig{
@@ -76,6 +81,8 @@ func NewDiscoveryService(port int, roomName string, discPort int, hasPassword fu
 		stopCh:      make(chan struct{}),
 		localAddrs:  getLocalAddrsMap(port),
 		hasPassword: hasPassword,
+		isRelay:     isRelay,
+		relayPeers:  make(map[string]time.Time),
 	}
 
 	go ds.listenLoop()
@@ -156,6 +163,11 @@ func (ds *DiscoveryService) listenLoop() {
 				ds.peersMu.Lock()
 				ds.peers[peerAddr] = time.Now()
 				ds.peersMu.Unlock()
+				if msg.IsRelay {
+					ds.relayPeersMu.Lock()
+					ds.relayPeers[peerAddr] = time.Now()
+					ds.relayPeersMu.Unlock()
+				}
 			}
 		case "query":
 			if msg.Room == "" || msg.Room == ds.roomName {
@@ -188,6 +200,7 @@ func (ds *DiscoveryService) announce() {
 		Port:        ds.localPort,
 		Version:     "0.4",
 		HasPassword: ds.hasPassword(),
+		IsRelay:     ds.isRelay(),
 	})
 }
 
@@ -198,6 +211,7 @@ func (ds *DiscoveryService) announceToAddr(addr *net.UDPAddr) {
 		Port:        ds.localPort,
 		Version:     "0.4",
 		HasPassword: ds.hasPassword(),
+		IsRelay:     ds.isRelay(),
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -216,15 +230,23 @@ func (ds *DiscoveryService) query() {
 }
 
 func (ds *DiscoveryService) cleanupPeers() {
-	ds.peersMu.Lock()
-	defer ds.peersMu.Unlock()
-
 	cutoff := time.Now().Add(-15 * time.Second)
+
+	ds.peersMu.Lock()
 	for addr, lastSeen := range ds.peers {
 		if lastSeen.Before(cutoff) {
 			delete(ds.peers, addr)
 		}
 	}
+	ds.peersMu.Unlock()
+
+	ds.relayPeersMu.Lock()
+	for addr, lastSeen := range ds.relayPeers {
+		if lastSeen.Before(cutoff) {
+			delete(ds.relayPeers, addr)
+		}
+	}
+	ds.relayPeersMu.Unlock()
 }
 
 func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
@@ -241,6 +263,25 @@ func (ds *DiscoveryService) LookupPeers(ctx context.Context) ([]string, error) {
 
 	peers := make([]string, 0, len(ds.peers))
 	for addr := range ds.peers {
+		peers = append(peers, addr)
+	}
+	return peers, nil
+}
+
+func (ds *DiscoveryService) LookupRelays(ctx context.Context) ([]string, error) {
+	ds.query()
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	ds.relayPeersMu.RLock()
+	defer ds.relayPeersMu.RUnlock()
+
+	peers := make([]string, 0, len(ds.relayPeers))
+	for addr := range ds.relayPeers {
 		peers = append(peers, addr)
 	}
 	return peers, nil
@@ -263,6 +304,7 @@ func DiscoverAllRooms(ctx context.Context, discPort int) ([]RoomInfo, error) {
 
 	roomsMap := make(map[string]map[string]bool)
 	roomHasPassword := make(map[string]bool)
+	roomIsRelay := make(map[string]bool)
 
 	queryMsg := DiscoveryMessage{
 		Type:    "query",
@@ -309,6 +351,9 @@ func DiscoverAllRooms(ctx context.Context, discPort int) ([]RoomInfo, error) {
 		}
 		roomsMap[msg.Room][peerAddr] = true
 		roomHasPassword[msg.Room] = msg.HasPassword
+		if msg.IsRelay {
+			roomIsRelay[msg.Room] = true
+		}
 	}
 
 done:
@@ -318,7 +363,7 @@ done:
 		for peer := range peersSet {
 			peers = append(peers, peer)
 		}
-		rooms = append(rooms, RoomInfo{Name: roomName, Peers: deduplicatePeers(peers), HasPassword: roomHasPassword[roomName]})
+		rooms = append(rooms, RoomInfo{Name: roomName, Peers: deduplicatePeers(peers), HasPassword: roomHasPassword[roomName], IsRelay: roomIsRelay[roomName]})
 	}
 	return rooms, nil
 }

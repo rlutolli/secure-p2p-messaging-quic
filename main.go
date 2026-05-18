@@ -3,7 +3,7 @@ Package main implements a secure peer-to-peer messaging application using QUIC o
 
 Usage:
 
-	./p2p-messenger [--debug | -d] [--use-tcp | -t] [--rendezvous <url>] [--discovery-port <n>]
+	./p2p-messenger [--debug | -d] [--use-tcp | -t] [--rendezvous <url>] [--discovery-port <n>] [--relay] [--no-upnp]
 
 Commands:
   - Type any text to send to all peers in the room
@@ -75,6 +75,9 @@ type App struct {
 	isPrivate     bool
 	useTCP        bool
 	rendezvousURL string
+	isRelay       bool
+	upnpCleanup   func()
+	externalAddr  string
 }
 
 var spinnerChars = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
@@ -97,7 +100,10 @@ func runSpinner(done chan bool, message string) {
 func main() {
 	var useTCP bool
 	var rendezvousURL string
+	var isRelay bool
 	discPort := 19999
+
+	upnpEnabled := false
 
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -116,6 +122,11 @@ func main() {
 				i++
 				fmt.Sscanf(args[i], "%d", &discPort)
 			}
+		case "--relay":
+			isRelay = true
+			upnpEnabled = true
+		case "--no-upnp":
+			upnpEnabled = false
 		}
 	}
 
@@ -144,6 +155,7 @@ func main() {
 	var roomPassword string
 	var isPrivate bool
 	var peersToConnect []string
+	var isCreatingRoom bool
 
 	if len(rooms) > 0 {
 		fmt.Println("\nAvailable rooms:")
@@ -163,6 +175,7 @@ func main() {
 
 		switch choice {
 		case "n", "N":
+			isCreatingRoom = true
 			fmt.Print("Enter new room name: ")
 			roomName, _ = reader.ReadString('\n')
 			roomName = strings.TrimSpace(roomName)
@@ -174,6 +187,7 @@ func main() {
 			password, _ := reader.ReadString('\n')
 			roomPassword = strings.TrimSpace(password)
 		case "p", "P":
+			isCreatingRoom = true
 			roomName = "private"
 			isPrivate = true
 		default:
@@ -193,6 +207,7 @@ func main() {
 			}
 		}
 	} else {
+		isCreatingRoom = true
 		fmt.Print("\nNo rooms found. Enter room name (or 'private' for hidden mode): ")
 		roomName, _ = reader.ReadString('\n')
 		roomName = strings.TrimSpace(roomName)
@@ -211,32 +226,50 @@ func main() {
 		}
 	}
 
-	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword)
+	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword, isRelay && isCreatingRoom, upnpEnabled)
 	if err != nil {
 		fmt.Printf("Failed to start: %v\n", err)
 		os.Exit(1)
 	}
 	defer app.shutdown()
 
-	if len(peersToConnect) > 0 {
-		fmt.Printf("Connecting to %d peer(s)...\n", len(peersToConnect))
-		connectCtx, connectCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		connectedCount := 0
-		for _, peerAddr := range peersToConnect {
-			if _, err := app.connManager.GetOrCreate(connectCtx, peerAddr); err == nil {
-				connectedCount++
+	if len(peersToConnect) > 0 || (!app.isRelay && app.discovery != nil) {
+		if !app.isRelay && app.discovery != nil {
+			connectCtx, connectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			relayPeers, _ := app.discovery.LookupRelays(connectCtx)
+			connectCancel()
+			if len(relayPeers) > 0 {
+				peersToConnect = relayPeers
+			} else {
+				peersToConnect = nil
 			}
 		}
-		connectCancel()
-		if connectedCount > 0 {
-			fmt.Printf("Connected to %s%d%s peer(s)\n", colorGreen, connectedCount, colorReset)
+		if len(peersToConnect) > 0 {
+			fmt.Printf("Connecting to %d peer(s)...\n", len(peersToConnect))
+			connectCtx, connectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			connectedCount := 0
+			for _, peerAddr := range peersToConnect {
+				if _, err := app.connManager.GetOrCreate(connectCtx, peerAddr); err == nil {
+					if !app.isRelay {
+						app.connManager.MarkRelay(peerAddr)
+					}
+					connectedCount++
+				}
+			}
+			connectCancel()
+			if connectedCount > 0 {
+				fmt.Printf("Connected to %s%d%s peer(s)\n", colorGreen, connectedCount, colorReset)
+			}
 		}
 	}
 
 	if rendezvousURL != "" && !isPrivate {
-		publicAddr := fmt.Sprintf("?:%d", app.server.Port())
-		if ip := resolvePublicIP(); ip != "" {
-			publicAddr = fmt.Sprintf("%s:%d", ip, app.server.Port())
+		publicAddr := app.externalAddr
+		if publicAddr == "" {
+			publicAddr = fmt.Sprintf("?:%d", app.server.Port())
+			if ip := resolvePublicIP(); ip != "" {
+				publicAddr = fmt.Sprintf("%s:%d", ip, app.server.Port())
+			}
 		}
 		go func() {
 			for {
@@ -270,16 +303,17 @@ func main() {
 	app.runCLI()
 }
 
-func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string) (*App, error) {
+func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string, isRelay bool, upnpEnabled bool) (*App, error) {
 	app := &App{
 		roomName:      roomName,
 		roomPassword:  roomPassword,
 		isPrivate:     isPrivate,
 		useTCP:        useTCP,
 		rendezvousURL: rendezvousURL,
+		isRelay:       isRelay,
 	}
 
-	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword)
+	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword, isRelay)
 
 	onMessage := func(from, room, message string) {
 		fmt.Printf("\n%s\n> ", formatMessage(from, message))
@@ -297,10 +331,21 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 
 	app.connManager.localPort = server.Port()
 
+	if isRelay && upnpEnabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		externalAddr, cleanup, err := TryPortMapping(ctx, server.Port(), "p2p-messenger-relay")
+		cancel()
+		if err == nil && externalAddr != "" {
+			app.externalAddr = externalAddr
+			app.upnpCleanup = cleanup
+			fmt.Printf("UPnP/NAT-PMP mapped port: %s\n", externalAddr)
+		}
+	}
+
 	if !isPrivate {
 		time.Sleep(200 * time.Millisecond)
 
-		discovery, err := NewDiscoveryService(server.Port(), roomName, discPort, func() bool { return app.roomPassword != "" })
+		discovery, err := NewDiscoveryService(server.Port(), roomName, discPort, func() bool { return app.roomPassword != "" }, func() bool { return app.isRelay })
 		if err != nil {
 			server.Close()
 			return nil, fmt.Errorf("discovery start failed: %w", err)
@@ -396,11 +441,22 @@ func (app *App) runCLI() {
 }
 
 func (app *App) sendToRoom(message string) {
-	peers := app.connManager.ListConnected()
+	var peers []string
+	if app.isRelay {
+		peers = app.connManager.ListConnected()
+	} else {
+		peers = app.connManager.GetRelayAddrs()
+	}
 
 	if len(peers) == 0 && app.discovery != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		discovered, err := app.discovery.LookupPeers(ctx)
+		var discovered []string
+		var err error
+		if app.isRelay {
+			discovered, err = app.discovery.LookupPeers(ctx)
+		} else {
+			discovered, err = app.discovery.LookupRelays(ctx)
+		}
 		cancel()
 
 		if err == nil {
@@ -414,6 +470,7 @@ func (app *App) sendToRoom(message string) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
 	successCount := 0
 	for _, addr := range peers {
@@ -421,7 +478,6 @@ func (app *App) sendToRoom(message string) {
 			successCount++
 		}
 	}
-	cancel()
 
 	if successCount == 0 {
 		fmt.Println("Failed to send message. Peers may be offline.")
@@ -517,6 +573,9 @@ func resolvePublicIP() string {
 }
 
 func (app *App) shutdown() {
+	if app.upnpCleanup != nil {
+		app.upnpCleanup()
+	}
 	if app.discovery != nil {
 		app.discovery.Shutdown()
 	}

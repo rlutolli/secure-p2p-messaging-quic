@@ -12,7 +12,7 @@ func newTestServer() *Server {
 		rooms:           make(map[string]*Room),
 		onMessage:       func(from, room, message string) {},
 		onSystemMessage: func(message string) {},
-		connManager:     NewConnectionManager(0, "testroom", true, ""),
+		connManager:     NewConnectionManager(0, "testroom", true, "", false),
 	}
 }
 
@@ -263,5 +263,27 @@ func TestJoinRoomWithWrongPassword(t *testing.T) {
 	written := mock2.getWritten()
 	if !strings.Contains(string(written), "AUTH:FAILED") {
 		t.Errorf("expected AUTH:FAILED response, got %q", string(written))
+	}
+}
+
+func TestBroadcastToMultiplePeers(t *testing.T) {
+	t.Parallel()
+	s := newTestServer()
+
+	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
+	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
+	s.joinRoom(peer1, "testroom", "")
+
+	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
+	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
+	s.joinRoom(peer2, "testroom", "")
+
+	s.handleMessage(peer1, "FROM:Alice|hello relay")
+	time.Sleep(100 * time.Millisecond)
+
+	written := mock2.getWritten()
+	expected := "FROM:Alice|hello relay\n"
+	if !strings.Contains(string(written), expected) {
+		t.Errorf("expected %q in peer2 writes, got %q", expected, string(written))
 	}
 }

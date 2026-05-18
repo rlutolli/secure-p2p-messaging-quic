@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"reflect"
 	"sort"
@@ -56,5 +57,27 @@ func TestGetLocalAddrsMap(t *testing.T) {
 	loopback := net.JoinHostPort("127.0.0.1", "12345")
 	if !addrs[loopback] {
 		t.Errorf("expected %s to be in local addrs", loopback)
+	}
+}
+
+func TestDiscoveryMessageIsRelay(t *testing.T) {
+	t.Parallel()
+	msg := DiscoveryMessage{
+		Type:    "announce",
+		Room:    "testroom",
+		Port:    5000,
+		Version: "0.4",
+		IsRelay: true,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	var parsed DiscoveryMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if !parsed.IsRelay {
+		t.Error("expected IsRelay to be true after round-trip")
 	}
 }
