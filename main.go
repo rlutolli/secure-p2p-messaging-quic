@@ -363,31 +363,11 @@ func (app *App) runCLI() {
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	fmt.Print("> ")
 
-	noArgCommands := map[string]bool{
-		"help":  true,
-		"?":     true,
-		"peers": true,
-		"room":  true,
-		"rooms": true,
-		"myip":  true,
-		"exit":  true,
-		"quit":  true,
-		"q":     true,
-		"bye":   true,
-	}
-
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			fmt.Print("> ")
 			continue
-		}
-
-		// Normalize: if the bare word is a known no-arg command, treat it as /command.
-		normalized := strings.ToLower(strings.SplitN(line, " ", 2)[0])
-		isSlashCmd := strings.HasPrefix(line, "/")
-		if !isSlashCmd && noArgCommands[normalized] {
-			line = "/" + line
 		}
 
 		if strings.HasPrefix(line, "/") {

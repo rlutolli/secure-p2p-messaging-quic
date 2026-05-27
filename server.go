@@ -184,6 +184,17 @@ func (s *Server) handlePeerConnection(pc PeerConnection, peerAddr string) {
 
 func (s *Server) handleMessage(peer *Peer, message string) {
 	if message == "PING" {
+		if s.connManager != nil {
+			s.connManager.mu.RLock()
+			mc, ok := s.connManager.connections[peer.addr]
+			s.connManager.mu.RUnlock()
+			if ok {
+				mc.mu.Lock()
+				peer.conn.Write([]byte("PONG\n"))
+				mc.mu.Unlock()
+				return
+			}
+		}
 		peer.conn.Write([]byte("PONG\n"))
 		return
 	}
@@ -325,7 +336,22 @@ func (s *Server) broadcastToRoom(room *Room, senderAddr, message string) {
 		wg.Add(1)
 		go func(p *Peer) {
 			defer wg.Done()
-			if _, err := p.conn.Write(msgBytes); err != nil {
+			var err error
+			if s.connManager != nil {
+				s.connManager.mu.RLock()
+				mc, ok := s.connManager.connections[p.addr]
+				s.connManager.mu.RUnlock()
+				if ok {
+					mc.mu.Lock()
+					_, err = p.conn.Write(msgBytes)
+					mc.mu.Unlock()
+				} else {
+					_, err = p.conn.Write(msgBytes)
+				}
+			} else {
+				_, err = p.conn.Write(msgBytes)
+			}
+			if err != nil {
 				log.Printf("[Server] Broadcast error to %s: %v", p.addr, err)
 			}
 		}(peer)
