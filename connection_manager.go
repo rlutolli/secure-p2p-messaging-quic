@@ -146,17 +146,26 @@ func (cm *ConnectionManager) healthCheck() {
 		}
 
 		for _, mc := range needPing {
-			go func(c *ManagedConnection, addr string) {
-				c.mu.Lock()
-				_, err := c.conn.Write([]byte("PING\n"))
-				c.mu.Unlock()
+			go func(addr string) {
+				cm.mu.RLock()
+				current, ok := cm.connections[addr]
+				cm.mu.RUnlock()
+				if !ok {
+					cm.pendingPingsMu.Lock()
+					delete(cm.pendingPings, addr)
+					cm.pendingPingsMu.Unlock()
+					return
+				}
+				current.mu.Lock()
+				_, err := current.conn.Write([]byte("PING\n"))
+				current.mu.Unlock()
 				if err != nil {
 					cm.pendingPingsMu.Lock()
 					delete(cm.pendingPings, addr)
 					cm.pendingPingsMu.Unlock()
 					cm.removeConnection(addr)
 				}
-			}(mc, mc.peerAddr)
+			}(mc.peerAddr)
 		}
 	}
 }
