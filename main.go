@@ -127,6 +127,13 @@ func main() {
 			upnpEnabled = true
 		case "--no-upnp":
 			upnpEnabled = false
+		case "--disable-gso":
+			// WAN remedy: some paths silently drop GSO-coalesced UDP datagrams.
+			// quic-go reads this env var when the socket is created.
+			os.Setenv("QUIC_GO_DISABLE_GSO", "true")
+		case "--disable-ecn":
+			// WAN remedy: some paths drop ECN-marked datagrams.
+			os.Setenv("QUIC_GO_DISABLE_ECN", "true")
 		}
 	}
 

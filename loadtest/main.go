@@ -190,7 +190,22 @@ func main() {
 	flag.StringVar(&cfg.mode, "mode", "scale", "benchmark mode: dial, latency, throughput, scale")
 	flag.StringVar(&cfg.sizes, "sizes", "64,256,1024,4096,16384,65536", "comma-separated message sizes for latency mode")
 	flag.StringVar(&cfg.rates, "rates", "1,5,10,50,100", "comma-separated message rates for throughput mode")
+	// WAN remedy: some network paths (cross-region, cloud overlays) silently
+	// drop GSO-coalesced or ECN-marked UDP datagrams. The QUIC handshake still
+	// succeeds (small single packets) but sustained data transfer gets 0%.
+	// These flags let quic-go fall back to plain, un-coalesced sends.
+	disableGSO := flag.Bool("disable-gso", true, "disable UDP GSO (set QUIC_GO_DISABLE_GSO); recommended over WAN")
+	disableECN := flag.Bool("disable-ecn", true, "disable ECN (set QUIC_GO_DISABLE_ECN); recommended over WAN")
 	flag.Parse()
+
+	// Must be set before any QUIC socket is created (quic-go reads these at
+	// socket-creation time).
+	if *disableGSO {
+		os.Setenv("QUIC_GO_DISABLE_GSO", "true")
+	}
+	if *disableECN {
+		os.Setenv("QUIC_GO_DISABLE_ECN", "true")
+	}
 
 	if cfg.target == "" || cfg.target == "127.0.0.1:0" {
 		fmt.Fprintln(os.Stderr, "Error: -target is required (e.g. 127.0.0.1:8080)")
@@ -200,6 +215,11 @@ func main() {
 	if cfg.proto != "quic" && cfg.proto != "tcp" {
 		fmt.Fprintf(os.Stderr, "Error: -proto must be 'quic' or 'tcp', got %q\n", cfg.proto)
 		os.Exit(1)
+	}
+	if cfg.n < 2 && (cfg.mode == "scale" || cfg.mode == "throughput" || cfg.mode == "latency") {
+		fmt.Fprintf(os.Stderr, "Warning: -n=%d. The relay broadcasts only to OTHER peers in the room; "+
+			"a single peer never receives its own messages back, so msgs_recv will be 0 by design. "+
+			"Use -n 2 or more to measure delivery/RTT.\n", cfg.n)
 	}
 
 	switch cfg.mode {
@@ -923,7 +943,14 @@ func dialQUIC(ctx context.Context, target string) (io.ReadWriteCloser, error) {
 		NextProtos:         []string{"p2p-messenger/1.0"},
 		MinVersion:         tls.VersionTLS13,
 	}
-	qconn, err := quic.DialAddr(ctx, target, tlsConf, &quic.Config{})
+	// Mirror the app's QUIC config so the client also sends transport-level
+	// keepalives and tolerates WAN RTT. Previously this used an empty
+	// quic.Config{}: the client sent no keepalives and used the 30s default
+	// idle timeout, so a quiet client could be torn down mid-test over WAN.
+	qconn, err := quic.DialAddr(ctx, target, tlsConf, &quic.Config{
+		MaxIdleTimeout:  60 * time.Second,
+		KeepAlivePeriod: 15 * time.Second,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dialQUIC: %w", err)
 	}
