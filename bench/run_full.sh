@@ -62,6 +62,12 @@ DURATION="${DURATION:-30}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 SKIP_RAW="${SKIP_RAW:-0}"
 
+# Scale parameters (override with env vars to dial up/down)
+DIAL_PEERS="${DIAL_PEERS:-10 50 100 200 500}"
+SCALE_PEERS="${SCALE_PEERS:-50 200 500 1000}"
+THROUGHPUT_RATES="${THROUGHPUT_RATES:-1 5 10 50 100}"
+STREAM_COUNTS="${STREAM_COUNTS:-8}"
+
 # ─── CLI arg parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -140,7 +146,12 @@ echo "  → OUTPUT_DIR: $(cd "$OUTPUT_DIR" && pwd)"
 
 # ─── Run tracking for sleep logic ──────────────────────────────────────────────
 RUN_COUNT=0
-TOTAL_RUNS=40  # 10 connection + 12 latency + 8 scale + 10 throughput
+# Calculate total runs dynamically
+dial_count=$(echo "$DIAL_PEERS" | wc -w)
+scale_count=$(echo "$SCALE_PEERS" | wc -w)
+throughput_count=$(echo "$THROUGHPUT_RATES" | wc -w)
+latency_count=6  # 6 sizes
+TOTAL_RUNS=$(( (dial_count + scale_count + throughput_count + latency_count) * 2 ))
 if [[ "$SKIP_RAW" != "1" && "$SKIP_RAW" != "true" ]]; then
   TOTAL_RUNS=$((TOTAL_RUNS + 2))
 fi
@@ -157,7 +168,7 @@ maybe_sleep() {
 hdr "Dimension 1: Connection (dial time at scale)  $(ts)"
 
 for PROTO in tcp quic; do
-  for N in 10 50 100 200 500; do
+  for N in $DIAL_PEERS; do
     OUT_CSV="$OUTPUT_DIR/connection/dial_${PROTO}_${N}.csv"
     echo "  [$(ts)] dial | proto=$PROTO | n=$N"
     ./loadtest-bin \
@@ -196,10 +207,10 @@ if [[ "$SKIP_RAW" != "1" && "$SKIP_RAW" != "true" ]]; then
 
   for PROTO in tcp quic; do
     OUT_LOG="$OUTPUT_DIR/multistream/mplex_${PROTO}.log"
-    echo "  [$(ts)] multistream | proto=$PROTO | n=8 | addr=$HOST | port=$PORT"
+    echo "  [$(ts)] multistream | proto=$PROTO | n=$STREAM_COUNTS | addr=$HOST | port=$PORT"
     if go run raw_mini/multiplex_bench.go \
       -proto "$PROTO" \
-      -n 8 \
+      -n "$STREAM_COUNTS" \
       -addr "$HOST" \
       -tcpport "$PORT" \
       -quicport "$PORT" > "$OUT_LOG" 2>&1; then
@@ -217,7 +228,7 @@ fi
 hdr "Dimension 4: Scale (many peers)  $(ts)"
 
 for PROTO in tcp quic; do
-  for N in 50 200 500 1000; do
+  for N in $SCALE_PEERS; do
     OUT_CSV="$OUTPUT_DIR/scale/scale_${PROTO}_${N}.csv"
     echo "  [$(ts)] scale | proto=$PROTO | n=$N | rate=1 | duration=${DURATION}s | size=100"
     ./loadtest-bin \
@@ -239,7 +250,7 @@ done
 hdr "Dimension 5: Throughput (msg rate sweep)  $(ts)"
 
 for PROTO in tcp quic; do
-  for RATE in 1 5 10 50 100; do
+  for RATE in $THROUGHPUT_RATES; do
     OUT_CSV="$OUTPUT_DIR/throughput/throughput_${PROTO}_${RATE}.csv"
     echo "  [$(ts)] throughput | proto=$PROTO | n=50 | rate=$RATE | duration=10 | size=100"
     ./loadtest-bin \
@@ -288,7 +299,7 @@ for LOG in "$OUTPUT_DIR"/multistream/mplex_*.log; do
   BASENAME=$(basename "$LOG" .log)
   PROTO=$(echo "$BASENAME" | cut -d'_' -f2)
   printf "  %-20s %-8s %-12s %-10s %s\n" \
-    "multistream" "$PROTO" "n=8" "OK" "$LOG"
+    "multistream" "$PROTO" "n=$STREAM_COUNTS" "OK" "$LOG"
 done
 
 for CSV in "$OUTPUT_DIR"/scale/scale_*.csv; do
