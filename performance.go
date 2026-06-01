@@ -24,6 +24,16 @@ const (
 	ConnectTimeout = 5 * time.Second
 	SendTimeout    = 2 * time.Second
 
+	// MaxConcurrentHandshakes bounds how many inbound connections may be in the
+	// setup phase (TLS handshake / first QUIC stream accept) at once. This
+	// smooths out a thundering herd of peers connecting simultaneously so the
+	// relay does not thrash on crypto or exhaust the accept queue.
+	MaxConcurrentHandshakes = 256
+	// HandshakeSetupTimeout caps how long the relay waits for a freshly accepted
+	// connection to complete setup before dropping it, so a stalled client
+	// cannot hold a setup slot indefinitely.
+	HandshakeSetupTimeout = 30 * time.Second
+
 	recommendedUDPBufSize = 7 * 1024 * 1024
 )
 
