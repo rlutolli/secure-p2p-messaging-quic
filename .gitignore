@@ -1,6 +1,7 @@
 # Binaries for programs and plugins
 secure-p2p-messaging-quic
 p2p-messenger
+loadtest-bin
 *.exe
 *.exe~
 *.dll
@@ -33,3 +34,7 @@ tls_keys.log
 *.log
 p2p-messenger
 *.json
+
+# Benchmark outputs
+bench_results/
+bench_charts/
