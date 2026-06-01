@@ -553,7 +553,8 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 	atomic.StoreInt32(&senderFinished, 1)
 	// Allow time for in-flight replies to arrive before closing.
 	// WAN RTT is ~100ms; relay broadcast to N peers takes additional time.
-	time.Sleep(5 * time.Second)
+	// For scale tests with many peers, broadcasts queue up and need more time.
+	time.Sleep(15 * time.Second)
 	conn.Close()
 	<-readerDone
 	return
@@ -909,7 +910,8 @@ done:
 	atomic.StoreInt32(&senderFinished, 1)
 	// Allow time for in-flight replies to arrive before closing.
 	// WAN RTT is ~100ms; relay broadcast to N peers takes additional time.
-	time.Sleep(5 * time.Second)
+	// For scale tests with many peers, broadcasts queue up and need more time.
+	time.Sleep(15 * time.Second)
 	conn.Close()
 	<-readerDone
 	return
