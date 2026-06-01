@@ -21,6 +21,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"crypto/subtle"
 	"crypto/tls"
@@ -37,6 +38,7 @@ type Server struct {
 	onMessage       func(from, room, message string)
 	onSystemMessage func(message string)
 	connManager     *ConnectionManager
+	setupSem        chan struct{}
 }
 
 type Room struct {
@@ -96,6 +98,7 @@ func NewServer(addr string, onMessage func(from, room, message string), onSystem
 		onMessage:       onMessage,
 		onSystemMessage: onSystemMessage,
 		connManager:     connManager,
+		setupSem:        make(chan struct{}, MaxConcurrentHandshakes),
 	}
 
 	go s.acceptLoopQUIC()
@@ -107,6 +110,21 @@ func NewServer(addr string, onMessage func(from, room, message string), onSystem
 
 func (s *Server) Port() int {
 	return s.localPort
+}
+
+// acquireSetup and releaseSetup bound concurrent connection setup. They are
+// nil-safe so a Server constructed without a semaphore (e.g. in tests) simply
+// runs setup unbounded instead of deadlocking on a nil channel.
+func (s *Server) acquireSetup() {
+	if s.setupSem != nil {
+		s.setupSem <- struct{}{}
+	}
+}
+
+func (s *Server) releaseSetup() {
+	if s.setupSem != nil {
+		<-s.setupSem
+	}
 }
 
 func (s *Server) acceptLoopQUIC() {
@@ -122,8 +140,17 @@ func (s *Server) acceptLoopQUIC() {
 func (s *Server) handleQUICConnection(conn *quic.Conn) {
 	peerAddr := conn.RemoteAddr().String()
 
-	stream, err := conn.AcceptStream(context.Background())
+	// Bound concurrent setup so a burst of peers cannot overwhelm the relay's
+	// accept path. The slot is held only for the setup phase (waiting for the
+	// peer's first stream), not for the lifetime of the connection.
+	s.acquireSetup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), HandshakeSetupTimeout)
+	stream, err := conn.AcceptStream(ctx)
+	cancel()
+	s.releaseSetup()
 	if err != nil {
+		conn.CloseWithError(0, "stream accept timeout")
 		return
 	}
 
@@ -147,6 +174,23 @@ func (s *Server) acceptLoopTCP() {
 
 func (s *Server) handleTCPConnection(conn net.Conn) {
 	peerAddr := conn.RemoteAddr().String()
+
+	// Bound concurrent setup and force the TLS handshake to complete (with a
+	// deadline) under that bound, so a burst of peers cannot pile up unbounded
+	// crypto work. The deadline is cleared before entering the read loop.
+	s.acquireSetup()
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		_ = tlsConn.SetDeadline(time.Now().Add(HandshakeSetupTimeout))
+		if err := tlsConn.Handshake(); err != nil {
+			_ = tlsConn.SetDeadline(time.Time{})
+			tlsConn.Close()
+			s.releaseSetup()
+			return
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+	}
+	s.releaseSetup()
+
 	pc := &NetConnWrapper{Conn: conn}
 	s.handlePeerConnection(pc, peerAddr)
 }
