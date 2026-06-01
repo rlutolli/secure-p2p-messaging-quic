@@ -37,6 +37,8 @@ type config struct {
 	mode        string
 	sizes       string
 	rates       string
+	dialStagger time.Duration
+	dialRetries int
 }
 
 // Protocol replicated from the main p2p-messenger app (cannot be imported).
@@ -52,6 +54,181 @@ func (sw *safeWriter) Write(p []byte) (int, error) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	return sw.w.Write(p)
+}
+
+// errorClass categorises a dial/IO error so the benchmark can distinguish
+// real failures (which should fail a run) from benign end-of-test connection
+// teardown noise (which should be ignored).
+type errorClass int
+
+const (
+	errBenign    errorClass = iota // expected teardown: EOF, closed conn, app-error 0x0
+	errTransient                   // worth retrying: refused, timeout, reset
+	errReal                        // a genuine failure that is not obviously transient
+)
+
+// benignErrorSubstrings are emitted during normal connection teardown and do
+// not indicate a failed benchmark run.
+var benignErrorSubstrings = []string{
+	"Application error 0x0",
+	"use of closed network connection",
+	"context canceled",
+	"server closed",
+	"EOF",
+}
+
+// transientErrorSubstrings indicate the relay was momentarily overwhelmed and
+// a retry may succeed (thundering-herd at high peer counts).
+var transientErrorSubstrings = []string{
+	"connection refused",
+	"CONNECTION_REFUSED",
+	"i/o timeout",
+	"timeout",
+	"connection reset by peer",
+	"reset by peer",
+	"no route to host",
+	"can't assign requested address",
+}
+
+// classifyError maps an error to an errorClass using substring matching. The
+// quic-go and net errors are not exported as typed sentinels we can rely on
+// across versions, so substring matching is the pragmatic choice.
+func classifyError(err error) errorClass {
+	if err == nil {
+		return errBenign
+	}
+	if err == io.EOF {
+		return errBenign
+	}
+	s := err.Error()
+	for _, sub := range transientErrorSubstrings {
+		if strings.Contains(s, sub) {
+			return errTransient
+		}
+	}
+	for _, sub := range benignErrorSubstrings {
+		if strings.Contains(s, sub) {
+			return errBenign
+		}
+	}
+	return errReal
+}
+
+// isTransientDialError reports whether a failed dial is worth retrying.
+func isTransientDialError(err error) bool {
+	return classifyError(err) == errTransient
+}
+
+// effectiveStagger returns the per-peer launch delay. An explicit value always
+// wins; otherwise a default kicks in only at high peer counts to avoid a
+// thundering herd against the relay's accept loop.
+func effectiveStagger(explicit time.Duration, n int) time.Duration {
+	if explicit > 0 {
+		return explicit
+	}
+	if n >= 500 {
+		return 5 * time.Millisecond
+	}
+	return 0
+}
+
+// errorStats aggregates categorised error counts across all peers in a run so
+// the tool can print a trustworthy breakdown to stderr.
+type errorStats struct {
+	mu      sync.Mutex
+	counts  map[errorClass]int64
+	samples map[errorClass]string
+}
+
+func newErrorStats() *errorStats {
+	return &errorStats{
+		counts:  make(map[errorClass]int64),
+		samples: make(map[errorClass]string),
+	}
+}
+
+func (e *errorStats) record(err error) {
+	if err == nil {
+		return
+	}
+	c := classifyError(err)
+	e.mu.Lock()
+	e.counts[c]++
+	if _, ok := e.samples[c]; !ok {
+		e.samples[c] = err.Error()
+	}
+	e.mu.Unlock()
+}
+
+// realCount returns the number of errors that should be treated as genuine
+// failures (transient errors that survived retries plus real errors).
+func (e *errorStats) realCount() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.counts[errTransient] + e.counts[errReal]
+}
+
+// report prints a categorised error breakdown to stderr. It is a no-op when no
+// errors were recorded so clean runs stay quiet.
+func (e *errorStats) report(label string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	total := e.counts[errBenign] + e.counts[errTransient] + e.counts[errReal]
+	if total == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[%s] errors: benign=%d transient=%d real=%d\n",
+		label, e.counts[errBenign], e.counts[errTransient], e.counts[errReal])
+	for _, c := range []errorClass{errTransient, errReal} {
+		if s, ok := e.samples[c]; ok {
+			kind := "transient"
+			if c == errReal {
+				kind = "real"
+			}
+			fmt.Fprintf(os.Stderr, "  e.g. (%s): %s\n", kind, s)
+		}
+	}
+}
+
+// dialOnce performs a single dial using the configured protocol.
+func dialOnce(ctx context.Context, cfg config) (io.ReadWriteCloser, error) {
+	if cfg.proto == "quic" {
+		return dialQUIC(ctx, cfg.target)
+	}
+	return dialTCP(ctx, cfg.target)
+}
+
+// dialWithRetry dials the target, retrying transient failures up to
+// cfg.dialRetries times with exponential backoff. Non-transient errors fail
+// immediately. This smooths over the relay momentarily rejecting connections
+// under a thundering herd at high peer counts.
+func dialWithRetry(ctx context.Context, cfg config) (io.ReadWriteCloser, error) {
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	attempts := cfg.dialRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		conn, err := dialOnce(ctx, cfg)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if !isTransientDialError(err) {
+			return nil, err
+		}
+		if attempt == attempts-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dialWithRetry: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return nil, fmt.Errorf("dialWithRetry: failed after %d attempts: %w", attempts, lastErr)
 }
 
 // quicConn wraps a QUIC connection + stream so it satisfies io.ReadWriteCloser.
@@ -190,6 +367,8 @@ func main() {
 	flag.StringVar(&cfg.mode, "mode", "scale", "benchmark mode: dial, latency, throughput, scale")
 	flag.StringVar(&cfg.sizes, "sizes", "64,256,1024,4096,16384,65536", "comma-separated message sizes for latency mode")
 	flag.StringVar(&cfg.rates, "rates", "1,5,10,50,100", "comma-separated message rates for throughput mode")
+	flag.DurationVar(&cfg.dialStagger, "dial-stagger", 0, "delay between launching each peer dial (0 = auto: 5ms when n>=500, else 0)")
+	flag.IntVar(&cfg.dialRetries, "dial-retries", 3, "max dial attempts per peer on transient errors (>=1)")
 	// WAN remedy: some network paths (cross-region, cloud overlays) silently
 	// drop GSO-coalesced or ECN-marked UDP datagrams. The QUIC handshake still
 	// succeeds (small single packets) but sustained data transfer gets 0%.
@@ -242,17 +421,23 @@ func runDialMode(cfg config) {
 	defer cancel()
 
 	results := make([]dialResult, cfg.n)
+	es := newErrorStats()
 	var wg sync.WaitGroup
 
+	stagger := effectiveStagger(cfg.dialStagger, cfg.n)
 	for i := 0; i < cfg.n; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			results[id] = runDialPeer(ctx, cfg, id)
+			results[id] = runDialPeer(ctx, cfg, id, es)
 		}(i)
+		if stagger > 0 && i < cfg.n-1 {
+			time.Sleep(stagger)
+		}
 	}
 
 	wg.Wait()
+	es.report(fmt.Sprintf("dial %s n=%d", cfg.proto, cfg.n))
 
 	agg := aggregateDialResults(results, cfg)
 
@@ -300,20 +485,15 @@ func runDialMode(cfg config) {
 	}
 }
 
-func runDialPeer(ctx context.Context, cfg config, peerID int) dialResult {
+func runDialPeer(ctx context.Context, cfg config, peerID int, es *errorStats) dialResult {
 	res := dialResult{peerID: peerID}
 	dialStart := time.Now()
-	var conn io.ReadWriteCloser
-	var err error
 
-	if cfg.proto == "quic" {
-		conn, err = dialQUIC(ctx, cfg.target)
-	} else {
-		conn, err = dialTCP(ctx, cfg.target)
-	}
+	conn, err := dialWithRetry(ctx, cfg)
 	res.dialMs = float64(time.Since(dialStart).Milliseconds())
 	if err != nil {
 		res.err = err
+		es.record(err)
 		return res
 	}
 	conn.Close()
@@ -409,17 +589,23 @@ func runLatencyMode(cfg config) {
 
 	for _, size := range sizes {
 		results := make([]peerResult, cfg.n)
+		es := newErrorStats()
 		var wg sync.WaitGroup
 		gt := &globalTracker{sendTimes: make(map[string]time.Time)}
 
+		stagger := effectiveStagger(cfg.dialStagger, cfg.n)
 		for i := 0; i < cfg.n; i++ {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				runLatencyPeer(ctx, cfg, id, size, gt, &results[id])
+				runLatencyPeer(ctx, cfg, id, size, gt, &results[id], es)
 			}(i)
+			if stagger > 0 && i < cfg.n-1 {
+				time.Sleep(stagger)
+			}
 		}
 		wg.Wait()
+		es.report(fmt.Sprintf("latency %s n=%d size=%d", cfg.proto, cfg.n, size))
 
 		agg := aggregateLatencyResults(results, cfg, size)
 		if cfg.csv {
@@ -452,22 +638,16 @@ func runLatencyMode(cfg config) {
 	}
 }
 
-func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *globalTracker, res *peerResult) {
+func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *globalTracker, res *peerResult, es *errorStats) {
 	res.peerID = peerID
 	alias := fmt.Sprintf("%s-%d", cfg.aliasPrefix, peerID)
 
-	// 1. Dial
+	// 1. Dial (with retry on transient errors)
 	dialStart := time.Now()
-	var conn io.ReadWriteCloser
-	var err error
-
-	if cfg.proto == "quic" {
-		conn, err = dialQUIC(ctx, cfg.target)
-	} else {
-		conn, err = dialTCP(ctx, cfg.target)
-	}
+	conn, err := dialWithRetry(ctx, cfg)
 	if err != nil {
 		res.errors.Add(1)
+		es.record(err)
 		return
 	}
 	defer conn.Close()
@@ -484,12 +664,14 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
-				if err != io.EOF {
+				finished := atomic.LoadInt32(&senderFinished) == 1
+				// A close during/after teardown, or a benign close type, is
+				// expected cleanup and must not be counted as a real error.
+				if !finished && classifyError(err) != errBenign {
 					res.errors.Add(1)
-				}
-				fmt.Fprintf(os.Stderr, "[loadtest] peer %d reader error (senderFinished=%v): %v\n",
-					peerID, atomic.LoadInt32(&senderFinished) == 1, err)
-				if atomic.LoadInt32(&senderFinished) == 0 {
+					res.disconnected.Store(1)
+					es.record(err)
+				} else if !finished {
 					res.disconnected.Store(1)
 				}
 				return
@@ -500,12 +682,16 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 			}
 			if line == "PING" {
 				if _, werr := sw.Write([]byte("PONG\n")); werr != nil {
-					res.errors.Add(1)
+					if classifyError(werr) != errBenign {
+						res.errors.Add(1)
+						es.record(werr)
+					}
 				}
 				continue
 			}
 			if strings.HasPrefix(line, "AUTH:FAILED") {
 				res.errors.Add(1)
+				es.record(fmt.Errorf("auth failed: %s", line))
 				continue
 			}
 			if strings.HasPrefix(line, "FROM:") {
@@ -551,6 +737,7 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 	joinStart := time.Now()
 	if _, err := sw.Write([]byte(joinMsg)); err != nil {
 		res.errors.Add(1)
+		es.record(err)
 		conn.Close()
 		<-readerDone
 		return
@@ -570,6 +757,7 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 
 	if _, err := sw.Write([]byte(line)); err != nil {
 		res.errors.Add(1)
+		es.record(err)
 	} else {
 		res.msgsSent.Add(1)
 	}
@@ -690,19 +878,25 @@ func runThroughputMode(cfg config) {
 
 	for _, rate := range rates {
 		results := make([]peerResult, cfg.n)
+		es := newErrorStats()
 		var wg sync.WaitGroup
 		gt := &globalTracker{sendTimes: make(map[string]time.Time)}
 		localCfg := cfg
 		localCfg.rate = rate
 
+		stagger := effectiveStagger(cfg.dialStagger, cfg.n)
 		for i := 0; i < cfg.n; i++ {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				runPeer(ctx, localCfg, id, gt, &results[id])
+				runPeer(ctx, localCfg, id, gt, &results[id], es)
 			}(i)
+			if stagger > 0 && i < cfg.n-1 {
+				time.Sleep(stagger)
+			}
 		}
 		wg.Wait()
+		es.report(fmt.Sprintf("throughput %s n=%d rate=%d", cfg.proto, cfg.n, rate))
 
 		agg := aggregateThroughputResults(results, localCfg)
 		if cfg.csv {
@@ -781,18 +975,24 @@ func runScaleMode(cfg config) {
 	defer cancel()
 
 	results := make([]peerResult, cfg.n)
+	es := newErrorStats()
 	var wg sync.WaitGroup
 
 	gt := &globalTracker{sendTimes: make(map[string]time.Time)}
+	stagger := effectiveStagger(cfg.dialStagger, cfg.n)
 	for i := 0; i < cfg.n; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			runPeer(ctx, cfg, id, gt, &results[id])
+			runPeer(ctx, cfg, id, gt, &results[id], es)
 		}(i)
+		if stagger > 0 && i < cfg.n-1 {
+			time.Sleep(stagger)
+		}
 	}
 
 	wg.Wait()
+	es.report(fmt.Sprintf("scale %s n=%d", cfg.proto, cfg.n))
 
 	agg := aggregateResults(results, cfg)
 
@@ -816,22 +1016,16 @@ func runScaleMode(cfg config) {
 	}
 }
 
-func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res *peerResult) {
+func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res *peerResult, es *errorStats) {
 	res.peerID = peerID
 	alias := fmt.Sprintf("%s-%d", cfg.aliasPrefix, peerID)
 
-	// 1. Dial
+	// 1. Dial (with retry on transient errors)
 	dialStart := time.Now()
-	var conn io.ReadWriteCloser
-	var err error
-
-	if cfg.proto == "quic" {
-		conn, err = dialQUIC(ctx, cfg.target)
-	} else {
-		conn, err = dialTCP(ctx, cfg.target)
-	}
+	conn, err := dialWithRetry(ctx, cfg)
 	if err != nil {
 		res.errors.Add(1)
+		es.record(err)
 		return
 	}
 	defer conn.Close()
@@ -848,12 +1042,14 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
-				if err != io.EOF {
+				finished := atomic.LoadInt32(&senderFinished) == 1
+				// A close during/after teardown, or a benign close type, is
+				// expected cleanup and must not be counted as a real error.
+				if !finished && classifyError(err) != errBenign {
 					res.errors.Add(1)
-				}
-				fmt.Fprintf(os.Stderr, "[loadtest] peer %d reader error (senderFinished=%v): %v\n",
-					peerID, atomic.LoadInt32(&senderFinished) == 1, err)
-				if atomic.LoadInt32(&senderFinished) == 0 {
+					res.disconnected.Store(1)
+					es.record(err)
+				} else if !finished {
 					res.disconnected.Store(1)
 				}
 				return
@@ -864,12 +1060,16 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 			}
 			if line == "PING" {
 				if _, werr := sw.Write([]byte("PONG\n")); werr != nil {
-					res.errors.Add(1)
+					if classifyError(werr) != errBenign {
+						res.errors.Add(1)
+						es.record(werr)
+					}
 				}
 				continue
 			}
 			if strings.HasPrefix(line, "AUTH:FAILED") {
 				res.errors.Add(1)
+				es.record(fmt.Errorf("auth failed: %s", line))
 				continue
 			}
 			if strings.HasPrefix(line, "FROM:") {
@@ -915,6 +1115,7 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 	joinStart := time.Now()
 	if _, err := sw.Write([]byte(joinMsg)); err != nil {
 		res.errors.Add(1)
+		es.record(err)
 		conn.Close()
 		<-readerDone
 		return
@@ -948,7 +1149,10 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 		gt.mu.Unlock()
 
 		if _, err := sw.Write([]byte(line)); err != nil {
-			res.errors.Add(1)
+			if classifyError(err) != errBenign {
+				res.errors.Add(1)
+				es.record(err)
+			}
 			break
 		}
 		res.msgsSent.Add(1)

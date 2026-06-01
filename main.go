@@ -3,7 +3,7 @@ Package main implements a secure peer-to-peer messaging application using QUIC o
 
 Usage:
 
-	./p2p-messenger [--debug | -d] [--use-tcp | -t] [--rendezvous <url>] [--discovery-port <n>] [--relay] [--no-upnp]
+	./p2p-messenger [--debug | -d] [--use-tcp | -t] [--rendezvous <url>] [--discovery-port <n>] [--relay] [--relay-port <n>] [--no-upnp] [--disable-gso] [--disable-ecn]
 
 Commands:
   - Type any text to send to all peers in the room
@@ -25,12 +25,26 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/pion/stun/v3"
 )
+
+// parsePortArg validates a CLI-supplied port number (0-65535). A port of 0
+// means "let the OS pick a free port" (the historical default).
+func parsePortArg(s string) (int, error) {
+	p, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, fmt.Errorf("parsePortArg: invalid port %q: %w", s, err)
+	}
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("parsePortArg: port %d out of range 0-65535", p)
+	}
+	return p, nil
+}
 
 var debugMode = false
 
@@ -102,6 +116,7 @@ func main() {
 	var rendezvousURL string
 	var isRelay bool
 	discPort := 19999
+	relayPort := 0
 
 	upnpEnabled := false
 
@@ -121,6 +136,16 @@ func main() {
 			if i+1 < len(args) {
 				i++
 				fmt.Sscanf(args[i], "%d", &discPort)
+			}
+		case "--relay-port":
+			if i+1 < len(args) {
+				i++
+				p, err := parsePortArg(args[i])
+				if err != nil {
+					fmt.Printf("Invalid --relay-port: %v\n", err)
+					os.Exit(1)
+				}
+				relayPort = p
 			}
 		case "--relay":
 			isRelay = true
@@ -233,7 +258,7 @@ func main() {
 		}
 	}
 
-	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword, isRelay && isCreatingRoom, upnpEnabled)
+	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword, isRelay && isCreatingRoom, upnpEnabled, relayPort)
 	if err != nil {
 		fmt.Printf("Failed to start: %v\n", err)
 		os.Exit(1)
@@ -310,7 +335,7 @@ func main() {
 	app.runCLI()
 }
 
-func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string, isRelay bool, upnpEnabled bool) (*App, error) {
+func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string, isRelay bool, upnpEnabled bool, relayPort int) (*App, error) {
 	app := &App{
 		roomName:      roomName,
 		roomPassword:  roomPassword,
@@ -330,7 +355,11 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 		fmt.Printf("\n%s\n> ", formatSystemMessage(message))
 	}
 
-	server, err := NewServer("0.0.0.0:0", onMessage, onSystemMessage, app.connManager)
+	// relayPort of 0 binds to an OS-assigned ephemeral port (historical
+	// default). A fixed port keeps the relay reachable at a known address
+	// across restarts, which benchmark orchestration relies on.
+	bindAddr := fmt.Sprintf("0.0.0.0:%d", relayPort)
+	server, err := NewServer(bindAddr, onMessage, onSystemMessage, app.connManager)
 	if err != nil {
 		return nil, fmt.Errorf("server start failed: %w", err)
 	}
