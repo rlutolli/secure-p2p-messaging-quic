@@ -487,6 +487,8 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 				if err != io.EOF {
 					res.errors.Add(1)
 				}
+				fmt.Fprintf(os.Stderr, "[loadtest] peer %d reader error (senderFinished=%v): %v\n",
+					peerID, atomic.LoadInt32(&senderFinished) == 1, err)
 				if atomic.LoadInt32(&senderFinished) == 0 {
 					res.disconnected.Store(1)
 				}
@@ -508,10 +510,22 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 			}
 			if strings.HasPrefix(line, "FROM:") {
 				parts := strings.SplitN(strings.TrimPrefix(line, "FROM:"), "|", 3)
+				var msgID string
 				if len(parts) >= 2 {
-					msgID := parts[1]
-					gt.mu.Lock()
-					if sendTime, ok := gt.sendTimes[msgID]; ok {
+					msgID = parts[1]
+				}
+				gt.mu.Lock()
+				_, ok := gt.sendTimes[msgID]
+				// Real relay double-wraps: FROM:<sender>|<alias>|<msgID>|padding
+				// Test relay preserves:   FROM:<alias>|<msgID>|padding
+				// If parts[1] doesn't match, try extracting msgID from parts[2]
+				if !ok && len(parts) >= 3 {
+					innerParts := strings.SplitN(parts[2], "|", 2)
+					msgID = innerParts[0]
+					_, ok = gt.sendTimes[msgID]
+				}
+				if ok {
+					if sendTime, ok2 := gt.sendTimes[msgID]; ok2 {
 						delete(gt.sendTimes, msgID)
 						rtt := float64(time.Since(sendTime).Milliseconds())
 						res.rttMu.Lock()
@@ -519,8 +533,8 @@ func runLatencyPeer(ctx context.Context, cfg config, peerID int, size int, gt *g
 						res.rttMu.Unlock()
 						res.msgsRecv.Add(1)
 					}
-					gt.mu.Unlock()
 				}
+				gt.mu.Unlock()
 			}
 			// SYSTEM: and other lines are ignored for RTT purposes.
 		}
@@ -837,6 +851,8 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 				if err != io.EOF {
 					res.errors.Add(1)
 				}
+				fmt.Fprintf(os.Stderr, "[loadtest] peer %d reader error (senderFinished=%v): %v\n",
+					peerID, atomic.LoadInt32(&senderFinished) == 1, err)
 				if atomic.LoadInt32(&senderFinished) == 0 {
 					res.disconnected.Store(1)
 				}
@@ -858,10 +874,22 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 			}
 			if strings.HasPrefix(line, "FROM:") {
 				parts := strings.SplitN(strings.TrimPrefix(line, "FROM:"), "|", 3)
+				var msgID string
 				if len(parts) >= 2 {
-					msgID := parts[1]
-					gt.mu.Lock()
-					if sendTime, ok := gt.sendTimes[msgID]; ok {
+					msgID = parts[1]
+				}
+				gt.mu.Lock()
+				_, ok := gt.sendTimes[msgID]
+				// Real relay double-wraps: FROM:<sender>|<alias>|<msgID>|padding
+				// Test relay preserves:   FROM:<alias>|<msgID>|padding
+				// If parts[1] doesn't match, try extracting msgID from parts[2]
+				if !ok && len(parts) >= 3 {
+					innerParts := strings.SplitN(parts[2], "|", 2)
+					msgID = innerParts[0]
+					_, ok = gt.sendTimes[msgID]
+				}
+				if ok {
+					if sendTime, ok2 := gt.sendTimes[msgID]; ok2 {
 						delete(gt.sendTimes, msgID)
 						rtt := float64(time.Since(sendTime).Milliseconds())
 						res.rttMu.Lock()
@@ -869,8 +897,8 @@ func runPeer(ctx context.Context, cfg config, peerID int, gt *globalTracker, res
 						res.rttMu.Unlock()
 						res.msgsRecv.Add(1)
 					}
-					gt.mu.Unlock()
 				}
+				gt.mu.Unlock()
 			}
 			// SYSTEM: and other lines are ignored for RTT purposes.
 		}
