@@ -34,6 +34,7 @@ type DiscoveryService struct {
 	peers        map[string]time.Time
 	peersMu      sync.RWMutex
 	stopCh       chan struct{}
+	shutdownOnce sync.Once
 	localAddrs   map[string]bool
 	hasPassword  func() bool
 	isRelay      func() bool
@@ -288,7 +289,9 @@ func (ds *DiscoveryService) LookupRelays(ctx context.Context) ([]string, error) 
 }
 
 func (ds *DiscoveryService) Shutdown() {
-	close(ds.stopCh)
+	ds.shutdownOnce.Do(func() {
+		close(ds.stopCh)
+	})
 	if ds.conn != nil {
 		ds.conn.Close()
 	}
@@ -350,7 +353,9 @@ func DiscoverAllRooms(ctx context.Context, discPort int) ([]RoomInfo, error) {
 			roomsMap[msg.Room] = make(map[string]bool)
 		}
 		roomsMap[msg.Room][peerAddr] = true
-		roomHasPassword[msg.Room] = msg.HasPassword
+		// OR logic: if ANY peer advertises a password, the room is password-protected.
+		// Prevents non-relay peers from accidentally clearing the label.
+		roomHasPassword[msg.Room] = roomHasPassword[msg.Room] || msg.HasPassword
 		if msg.IsRelay {
 			roomIsRelay[msg.Room] = true
 		}

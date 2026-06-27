@@ -2,39 +2,68 @@
 secure-p2p-messaging-quic
 p2p-messenger
 loadtest-bin
+loadtest_bin
+quic_server
+tcp_server
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
+# raw_mini compiled binaries
+raw_mini/quic_bench
+raw_mini/quic_diagnostic
+raw_mini/quic_local
+raw_mini/tcp_local
+raw_mini/tcp_raw
+raw_mini/speed_bench/speed_bench
+raw_mini/speed_bench/parallel_bench
+
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Output of the go coverage tool
 *.out
 
 # Dependency directories
 # vendor/
 
-# IDEs
+# IDEs and tooling
 .vscode/
 .idea/
+.opencode/
+.kiro/
+.ruff_cache/
+
+# macOS
+.DS_Store
 
 # SECURITY - CRITICAL
-# Ignore TLS certificates and keys so I don't leak them
+# Ignore TLS certificates and keys
 *.pem
 *.key
 *.crt
-
-# TLS session key log – NEVER commit; contains secrets that decrypt traffic
 tls_keys.log
+tls_keys.txt
 
 # Log files
 *.log
-p2p-messenger
+
+# JSON data files (large benchmark dumps)
 *.json
+!go.mod
+!go.sum
+
+# Python cache
+__pycache__/
 
 # Benchmark outputs
 bench_results/
 bench_charts/
+
+# Graphify output (regenerated on demand)
+graphify-out/
+
+# Report (thesis) — excluded from code submission
+report/

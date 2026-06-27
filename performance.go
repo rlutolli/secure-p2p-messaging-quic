@@ -34,6 +34,15 @@ const (
 	// cannot hold a setup slot indefinitely.
 	HandshakeSetupTimeout = 30 * time.Second
 
+	// OutboundQueueSize bounds the per-connection outbound message queue. Each
+	// ManagedConnection is drained by a single dedicated writer goroutine, so a
+	// slow or stalled peer only backs up its own queue instead of blocking the
+	// relay's broadcast path (which previously ran on the per-peer reader
+	// goroutine and starved PING/PONG processing, triggering false-positive
+	// health-check disconnects at high peer counts). When a peer's queue is
+	// full its message is dropped rather than blocking every other peer.
+	OutboundQueueSize = 1024
+
 	recommendedUDPBufSize = 7 * 1024 * 1024
 )
 

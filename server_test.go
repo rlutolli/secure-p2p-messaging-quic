@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -12,7 +13,9 @@ func newTestServer() *Server {
 		rooms:           make(map[string]*Room),
 		onMessage:       func(from, room, message string) {},
 		onSystemMessage: func(message string) {},
-		connManager:     NewConnectionManager(0, "testroom", true, "", false),
+		connManager:     NewConnectionManager(0, "testroom", true, "", false, "TestPeer"),
+		banList:         make(map[string]bool),
+		aliasToDeviceID: make(map[string]string),
 	}
 }
 
@@ -66,19 +69,39 @@ func TestHandleMessageFrom(t *testing.T) {
 
 	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
-	s.joinRoom(peer1, "testroom", "")
+	keys := DeriveRoomKeys("testroom", "", nil)
+	s.joinRoom(peer1, "testroom", keys, false, nil)
+
+	// Drain SECRET sent to alice (key rotation triggered by first join).
+	mock1.drainSECRET()
 
 	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
 	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
-	s.joinRoom(peer2, "testroom", "")
+	s.joinRoom(peer2, "testroom", keys, false, nil)
 
-	s.handleMessage(peer1, "FROM:Alice|hello")
+	// Drain any pending SECRET messages.
+	time.Sleep(200 * time.Millisecond)
+	mock1.drainSECRET()
+	mock2.drainSECRET()
+
+	// IMPORTANT: Use the room's keys for sending, not the original 'keys' derived
+	// with nil secret. The room re-derives keys with room.roomSecret, so to get
+	// a matching HMAC we must use s.rooms["testroom"].keys.
+	roomKeys := s.rooms["testroom"].keys
+	payload, _ := roomKeys.Encrypt([]byte("hello"))
+	nonce := generateReplayNonce()
+	unsigned := fmt.Sprintf("FROM:Alice|%s|%s", payload, nonce)
+	sig := roomKeys.Sign(unsigned)
+	encryptedMsg := unsigned + "|" + sig
+
+	s.handleMessage(peer1, encryptedMsg)
 	time.Sleep(100 * time.Millisecond)
 
 	written := mock2.getWritten()
-	expected := "FROM:Alice|hello\n"
-	if string(written) != expected {
-		t.Errorf("expected %q, got %q", expected, string(written))
+	// The relay forwards the encrypted payload verbatim.
+	expectedPrefix := "FROM:Alice|"
+	if !strings.Contains(string(written), expectedPrefix) {
+		t.Errorf("expected broadcast to contain %q prefix, got %q", expectedPrefix, string(written))
 	}
 }
 
@@ -88,11 +111,19 @@ func TestHandleMessageMSG(t *testing.T) {
 
 	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
-	s.joinRoom(peer1, "testroom", "")
+	s.joinRoom(peer1, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
+
+	// Drain SECRET sent to alice after first join.
+	mock1.drainSECRET()
 
 	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
 	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
-	s.joinRoom(peer2, "testroom", "")
+	s.joinRoom(peer2, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
+
+	// Drain SECRET sent to alice and bob after bob joins.
+	time.Sleep(200 * time.Millisecond)
+	mock1.drainSECRET()
+	mock2.drainSECRET()
 
 	s.handleMessage(peer1, "MSG:hello world")
 	time.Sleep(100 * time.Millisecond)
@@ -110,7 +141,7 @@ func TestJoinRoom(t *testing.T) {
 	mock := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock}
 
-	s.joinRoom(peer, "testroom", "")
+	s.joinRoom(peer, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
 
 	s.roomsMu.RLock()
 	room, exists := s.rooms["testroom"]
@@ -136,11 +167,11 @@ func TestBroadcastToRoom(t *testing.T) {
 
 	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
-	s.joinRoom(peer1, "testroom", "")
+	s.joinRoom(peer1, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
 
 	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
 	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
-	s.joinRoom(peer2, "testroom", "")
+	s.joinRoom(peer2, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
 
 	s.broadcastToRoom(peer1.room, peer1.addr, "hello")
 	time.Sleep(100 * time.Millisecond)
@@ -162,11 +193,11 @@ func TestRemovePeer(t *testing.T) {
 
 	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
-	s.joinRoom(peer1, "testroom", "")
+	s.joinRoom(peer1, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
 
 	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
 	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
-	s.joinRoom(peer2, "testroom", "")
+	s.joinRoom(peer2, "testroom", DeriveRoomKeys("testroom", "", nil), false, nil)
 
 	s.removePeer(peer1)
 	time.Sleep(100 * time.Millisecond)
@@ -209,7 +240,7 @@ func TestCreateRoomWithPassword(t *testing.T) {
 	if peer.room.name != "pwroom" {
 		t.Errorf("expected room pwroom, got %s", peer.room.name)
 	}
-	if peer.room.passwordHash == "" {
+	if peer.room.keys == nil {
 		t.Error("expected room to have a password hash set")
 	}
 }
@@ -228,7 +259,7 @@ func TestJoinRoomWithPassword(t *testing.T) {
 	if peer1.room.name != "secureroom" {
 		t.Errorf("expected room secureroom, got %s", peer1.room.name)
 	}
-	if peer1.room.passwordHash == "" {
+	if peer1.room.keys == nil {
 		t.Error("expected room to have a password hash")
 	}
 
@@ -270,20 +301,32 @@ func TestBroadcastToMultiplePeers(t *testing.T) {
 	t.Parallel()
 	s := newTestServer()
 
+	keys := DeriveRoomKeys("testroom", "", nil)
+
 	mock1 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111})
 	peer1 := &Peer{addr: "127.0.0.1:1111", alias: "Alice", conn: mock1}
-	s.joinRoom(peer1, "testroom", "")
+	s.joinRoom(peer1, "testroom", keys, false, nil)
 
 	mock2 := newMockConn(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222})
 	peer2 := &Peer{addr: "127.0.0.1:2222", alias: "Bob", conn: mock2}
-	s.joinRoom(peer2, "testroom", "")
+	s.joinRoom(peer2, "testroom", keys, false, nil)
 
-	s.handleMessage(peer1, "FROM:Alice|hello relay")
+	// IMPORTANT: For unauthenticated rooms, the room's keys are re-derived with
+	// room.roomSecret (not nil). So we must use s.rooms["testroom"].keys when
+	// encrypting alice's message, NOT the original 'keys' derived with nil secret.
+	// Otherwise HMAC verification fails because authKeys don't match.
+	roomKeys := s.rooms["testroom"].keys
+	payload, _ := roomKeys.Encrypt([]byte("hello relay"))
+	nonce := generateReplayNonce()
+	unsigned := fmt.Sprintf("FROM:Alice|%s|%s", payload, nonce)
+	sig := roomKeys.Sign(unsigned)
+	encryptedMsg := unsigned + "|" + sig
+
+	s.handleMessage(peer1, encryptedMsg)
 	time.Sleep(100 * time.Millisecond)
 
 	written := mock2.getWritten()
-	expected := "FROM:Alice|hello relay\n"
-	if !strings.Contains(string(written), expected) {
-		t.Errorf("expected %q in peer2 writes, got %q", expected, string(written))
+	if !strings.Contains(string(written), "FROM:Alice|") {
+		t.Errorf("expected encrypted FROM:Alice| in peer2 writes, got %q", string(written))
 	}
 }

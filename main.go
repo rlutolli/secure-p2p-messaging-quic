@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -81,17 +83,24 @@ func colorPort(port int) string {
 }
 
 type App struct {
-	server        *Server
-	discovery     *DiscoveryService
-	connManager   *ConnectionManager
-	roomName      string
-	roomPassword  string
-	isPrivate     bool
-	useTCP        bool
-	rendezvousURL string
-	isRelay       bool
-	upnpCleanup   func()
-	externalAddr  string
+	server         *Server
+	discovery      *DiscoveryService
+	connManager    *ConnectionManager
+	roomName       string
+	roomPassword   string
+	isPrivate      bool
+	useTCP         bool
+	rendezvousURL  string
+	isRelay        bool
+	isCreatingRoom bool
+	upnpCleanup    func()
+	externalAddr   string
+	// userRequestedExit is set to true when the user types /exit or /quit.
+	// runCLI returns, and the main loop checks this flag to decide whether
+	// to break (exit program) or continue (go back to discovery).
+	userRequestedExit bool
+	// shutdownOnce ensures shutdown is idempotent across multiple calls.
+	shutdownOnce sync.Once
 }
 
 var spinnerChars = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
@@ -111,10 +120,126 @@ func runSpinner(done chan bool, message string) {
 	}
 }
 
+// roomSelection holds the user's choice at the discovery/room-selection prompt.
+type roomSelection struct {
+	roomName       string
+	roomPassword   string
+	isPrivate      bool
+	peersToConnect []string
+	isCreatingRoom bool
+	quit           bool
+}
+
+// promptRoomSelection runs the LAN discovery scan and shows the interactive
+// room-selection menu. It returns the user's chosen room details or sets
+// quit=true when the user selects 'q'.
+func promptRoomSelection(reader *bufio.Reader, discPort int) roomSelection {
+	done := make(chan bool, 1)
+	go runSpinner(done, "Scanning LAN for rooms")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	rooms, _ := DiscoverAllRooms(ctx, discPort)
+	cancel()
+
+	done <- true
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println()
+
+	var result roomSelection
+
+	if len(rooms) > 0 {
+		fmt.Println("\nAvailable rooms:")
+		for i, room := range rooms {
+			indicator := ""
+			if room.HasPassword {
+				indicator = " [password protected]"
+			}
+			fmt.Printf("  %s%d%s. %s (%d peer(s))%s\n", colorCyan, i+1, colorReset, room.Name, len(room.Peers), indicator)
+		}
+		fmt.Println("  n. Create new room")
+		fmt.Println("  p. Private mode (hidden)")
+		fmt.Println("  q. Quit")
+		fmt.Print("\nSelect option: ")
+
+		choice, _ := reader.ReadString('\n')
+		choice = strings.TrimSpace(choice)
+
+		switch choice {
+		case "q", "Q":
+			result.quit = true
+			return result
+		case "n", "N":
+			result.isCreatingRoom = true
+			fmt.Print("Enter new room name: ")
+			result.roomName, _ = reader.ReadString('\n')
+			result.roomName = strings.TrimSpace(result.roomName)
+			if result.roomName == "" {
+				result.roomName = "default"
+			}
+			result.isPrivate = false
+			fmt.Print("Set a password? (leave empty for none): ")
+			password, _ := reader.ReadString('\n')
+			result.roomPassword = strings.TrimSpace(password)
+		case "p", "P":
+			result.isCreatingRoom = true
+			result.roomName = "private"
+			result.isPrivate = true
+			// Always offer password prompt, even for private rooms.
+			fmt.Print("Set a password? (leave empty for none): ")
+			pw, _ := reader.ReadString('\n')
+			result.roomPassword = strings.TrimSpace(pw)
+		default:
+			var idx int
+			if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil && idx > 0 && idx <= len(rooms) {
+				result.roomName = rooms[idx-1].Name
+				result.peersToConnect = rooms[idx-1].Peers
+				result.isPrivate = false
+				// Always prompt for a password when joining. The [password protected]
+				// discovery label is unreliable (non-relay peers don't advertise it),
+				// but the server will correctly reject incorrect passwords.
+				fmt.Print("Enter room password (leave empty if none): ")
+				password, _ := reader.ReadString('\n')
+				result.roomPassword = strings.TrimSpace(password)
+			} else {
+				result.roomName = choice
+				result.isPrivate = false
+				// Treating a typed name as a new room — prompt for password
+				// just like the "n" (create new) path does.
+				fmt.Print("Set a password? (leave empty for none): ")
+				pw, _ := reader.ReadString('\n')
+				result.roomPassword = strings.TrimSpace(pw)
+			}
+		}
+	} else {
+		fmt.Print("\nNo rooms found. Enter room name (or 'private' for hidden mode, 'q' to quit): ")
+		nameInput, _ := reader.ReadString('\n')
+		nameInput = strings.TrimSpace(nameInput)
+		// Check for quit first
+		if nameInput == "q" || nameInput == "Q" || strings.EqualFold(nameInput, "quit") {
+			result.quit = true
+			return result
+		}
+		result.isCreatingRoom = true
+		result.roomName = nameInput
+		if result.roomName == "" {
+			result.roomName = "default"
+		}
+		result.isPrivate = strings.ToLower(result.roomName) == "private"
+		// Always offer the password prompt, even for private rooms. The user
+		// can leave it empty for no password — it's optional either way.
+		fmt.Print("Set a password? (leave empty for none): ")
+		pw, _ := reader.ReadString('\n')
+		result.roomPassword = strings.TrimSpace(pw)
+	}
+
+	return result
+}
+
 func main() {
 	var useTCP bool
 	var rendezvousURL string
 	var isRelay bool
+	var raceMode bool
 	discPort := 19999
 	relayPort := 0
 
@@ -159,6 +284,9 @@ func main() {
 		case "--disable-ecn":
 			// WAN remedy: some paths drop ECN-marked datagrams.
 			os.Setenv("QUIC_GO_DISABLE_ECN", "true")
+		case "--race":
+			// Happy-Eyeballs style: dial QUIC and TCP in parallel, keep the winner.
+			raceMode = true
 		}
 	}
 
@@ -170,182 +298,132 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Printf("Secure P2P Messenger (v0.4 — TCP: %v)\n", useTCP)
+	fmt.Printf("Secure P2P Messenger (v0.5 — TCP: %v)\n", useTCP)
 
-	done := make(chan bool, 1)
-	go runSpinner(done, "Scanning LAN for rooms")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	rooms, _ := DiscoverAllRooms(ctx, discPort)
-	cancel()
-
-	done <- true
-	time.Sleep(50 * time.Millisecond)
-	fmt.Println()
-
-	var roomName string
-	var roomPassword string
-	var isPrivate bool
-	var peersToConnect []string
-	var isCreatingRoom bool
-
-	if len(rooms) > 0 {
-		fmt.Println("\nAvailable rooms:")
-		for i, room := range rooms {
-			indicator := ""
-			if room.HasPassword {
-				indicator = " [password protected]"
-			}
-			fmt.Printf("  %s%d%s. %s (%d peer(s))%s\n", colorCyan, i+1, colorReset, room.Name, len(room.Peers), indicator)
-		}
-		fmt.Println("  n. Create new room")
-		fmt.Println("  p. Private mode (hidden)")
-		fmt.Print("\nSelect option: ")
-
-		choice, _ := reader.ReadString('\n')
-		choice = strings.TrimSpace(choice)
-
-		switch choice {
-		case "n", "N":
-			isCreatingRoom = true
-			fmt.Print("Enter new room name: ")
-			roomName, _ = reader.ReadString('\n')
-			roomName = strings.TrimSpace(roomName)
-			if roomName == "" {
-				roomName = "default"
-			}
-			isPrivate = false
-			fmt.Print("Set a password? (leave empty for none): ")
-			password, _ := reader.ReadString('\n')
-			roomPassword = strings.TrimSpace(password)
-		case "p", "P":
-			isCreatingRoom = true
-			roomName = "private"
-			isPrivate = true
-		default:
-			var idx int
-			if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil && idx > 0 && idx <= len(rooms) {
-				roomName = rooms[idx-1].Name
-				peersToConnect = rooms[idx-1].Peers
-				isPrivate = false
-				if rooms[idx-1].HasPassword {
-					fmt.Print("Enter room password: ")
-					password, _ := reader.ReadString('\n')
-					roomPassword = strings.TrimSpace(password)
-				}
-			} else {
-				roomName = choice
-				isPrivate = false
-			}
-		}
-	} else {
-		isCreatingRoom = true
-		fmt.Print("\nNo rooms found. Enter room name (or 'private' for hidden mode): ")
-		roomName, _ = reader.ReadString('\n')
-		roomName = strings.TrimSpace(roomName)
-		if roomName == "" {
-			roomName = "default"
-		}
-		isPrivate = strings.ToLower(roomName) == "private"
-	}
-
-	if rendezvousURL != "" {
-		rCtx, rCancel := context.WithTimeout(context.Background(), 4*time.Second)
-		rPeers, err := FetchPeers(rCtx, rendezvousURL, roomName)
-		rCancel()
-		if err == nil {
-			peersToConnect = append(peersToConnect, rPeers...)
-		}
-	}
-
-	app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword, isRelay && isCreatingRoom, upnpEnabled, relayPort)
-	if err != nil {
-		fmt.Printf("Failed to start: %v\n", err)
-		os.Exit(1)
-	}
-	defer app.shutdown()
-
-	if len(peersToConnect) > 0 || (!app.isRelay && app.discovery != nil) {
-		if !app.isRelay && app.discovery != nil {
-			connectCtx, connectCancel := context.WithTimeout(context.Background(), 3*time.Second)
-			relayPeers, _ := app.discovery.LookupRelays(connectCtx)
-			connectCancel()
-			if len(relayPeers) > 0 {
-				peersToConnect = relayPeers
-			} else {
-				peersToConnect = nil
-			}
-		}
-		if len(peersToConnect) > 0 {
-			fmt.Printf("Connecting to %d peer(s)...\n", len(peersToConnect))
-			connectCtx, connectCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			connectedCount := 0
-			for _, peerAddr := range peersToConnect {
-				if _, err := app.connManager.GetOrCreate(connectCtx, peerAddr); err == nil {
-					if !app.isRelay {
-						app.connManager.MarkRelay(peerAddr)
-					}
-					connectedCount++
-				}
-			}
-			connectCancel()
-			if connectedCount > 0 {
-				fmt.Printf("Connected to %s%d%s peer(s)\n", colorGreen, connectedCount, colorReset)
-			}
-		}
-	}
-
-	if rendezvousURL != "" && !isPrivate {
-		publicAddr := app.externalAddr
-		if publicAddr == "" {
-			publicAddr = fmt.Sprintf("?:%d", app.server.Port())
-			if ip := resolvePublicIP(); ip != "" {
-				publicAddr = fmt.Sprintf("%s:%d", ip, app.server.Port())
-			}
-		}
-		go func() {
-			for {
-				rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := RenewRegistration(rCtx, rendezvousURL, roomName, publicAddr); err != nil {
-					log.Printf("[Rendezvous] Registration failed: %v", err)
-				}
-				rCancel()
-				time.Sleep(30 * time.Second)
-			}
-		}()
-	}
-
+	// Signal handler — SIGINT/SIGTERM always exits the program.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		app.shutdown()
-		os.Exit(0)
-	}()
+	racePrinted := false
 
-	fmt.Printf("\nStarted | Port: %s%d%s | Room: %s | You: %s%s%s | TCP: %v\n",
-		colorCyan, app.server.Port(), colorReset,
-		roomName,
-		colorGreen, app.connManager.GetLocalAlias(), colorReset,
-		useTCP)
-	app.showHelp()
+	for {
+		// Check whether the user hit Ctrl+C at a prompt.
+		select {
+		case <-sigChan:
+			fmt.Println("\nShutting down...")
+			return
+		default:
+		}
 
-	app.runCLI()
+		sel := promptRoomSelection(reader, discPort)
+		if sel.quit {
+			fmt.Println("Bye")
+			return
+		}
+
+		roomName := sel.roomName
+		roomPassword := sel.roomPassword
+		isPrivate := sel.isPrivate
+		peersToConnect := sel.peersToConnect
+		isCreatingRoom := sel.isCreatingRoom
+
+		if rendezvousURL != "" {
+			rCtx, rCancel := context.WithTimeout(context.Background(), 4*time.Second)
+			rPeers, err := FetchPeers(rCtx, rendezvousURL, roomName)
+			rCancel()
+			if err == nil {
+				peersToConnect = append(peersToConnect, rPeers...)
+			}
+		}
+
+		app, err := initializeApp(roomName, isPrivate, useTCP, discPort, rendezvousURL, roomPassword, isRelay && isCreatingRoom, upnpEnabled, relayPort, isCreatingRoom)
+		if err != nil {
+			fmt.Printf("Failed to start: %v\n", err)
+			continue
+		}
+		app.userRequestedExit = false
+
+		if raceMode && !racePrinted {
+			app.connManager.raceTransports = true
+			fmt.Println("Transport: racing QUIC and TCP (Happy-Eyeballs); first handshake wins")
+			racePrinted = true
+		}
+
+		if !app.tryConnect(reader, peersToConnect) {
+			app.shutdown()
+			continue
+		}
+
+		if rendezvousURL != "" && !isPrivate {
+			publicAddr := app.externalAddr
+			if publicAddr == "" {
+				publicAddr = fmt.Sprintf("?:%d", app.server.Port())
+				if ip := resolvePublicIP(); ip != "" {
+					publicAddr = fmt.Sprintf("%s:%d", ip, app.server.Port())
+				}
+			}
+			go func() {
+				for {
+					rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := RenewRegistration(rCtx, rendezvousURL, roomName, publicAddr); err != nil {
+						log.Printf("[Rendezvous] Registration failed: %v", err)
+					}
+					rCancel()
+					time.Sleep(30 * time.Second)
+				}
+			}()
+		}
+
+		// Only require at least one connection if we were trying to JOIN an existing
+		// room (i.e. we're not a relay and didn't create the room). Room creators
+		// and relays don't need outgoing connections at startup — they wait for
+		// incoming ones.
+		isJoiner := !isRelay && !isCreatingRoom
+		hasPeer := len(app.connManager.ListConnected()) > 0
+		if hasPeer || !isJoiner {
+			fmt.Printf("\nStarted | Port: %s%d%s | Room: %s | You: %s%s%s | TCP: %v\n",
+				colorCyan, app.server.Port(), colorReset,
+				roomName,
+				colorGreen, app.connManager.GetLocalAlias(), colorReset,
+				useTCP)
+			app.showHelp()
+
+			app.runCLI()
+
+			if app.userRequestedExit {
+				app.shutdown()
+				return // exit program
+			}
+
+			// kicked or disconnected — cleanup and loop back to discovery
+			app.shutdown()
+		} else {
+			fmt.Println("\nNo connections established. Returning to room selection...")
+			app.shutdown()
+		}
+	}
 }
 
-func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string, isRelay bool, upnpEnabled bool, relayPort int) (*App, error) {
+func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, rendezvousURL string, roomPassword string, isRelay bool, upnpEnabled bool, relayPort int, isCreatingRoom bool) (*App, error) {
 	app := &App{
-		roomName:      roomName,
-		roomPassword:  roomPassword,
-		isPrivate:     isPrivate,
-		useTCP:        useTCP,
-		rendezvousURL: rendezvousURL,
-		isRelay:       isRelay,
+		roomName:       roomName,
+		roomPassword:   roomPassword,
+		isPrivate:      isPrivate,
+		useTCP:         useTCP,
+		rendezvousURL:  rendezvousURL,
+		isRelay:        isRelay,
+		isCreatingRoom: isCreatingRoom,
 	}
 
-	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword, isRelay)
+	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword, isRelay, "")
+
+	// Optional persistent TOFU store (SSH-style known_hosts). Off by default so
+	// behaviour and benchmarks are unchanged unless P2P_KNOWN_PEERS is set.
+	if kp := os.Getenv("P2P_KNOWN_PEERS"); kp != "" {
+		if err := app.connManager.LoadKnownPeers(kp); err != nil {
+			log.Printf("[TOFU] could not load known peers from %s: %v", kp, err)
+		}
+	}
 
 	onMessage := func(from, room, message string) {
 		fmt.Printf("\n%s\n> ", formatMessage(from, message))
@@ -364,6 +442,14 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 		return nil, fmt.Errorf("server start failed: %w", err)
 	}
 	app.server = server
+
+	// Pre-create room in the local server so incoming JOINs from peers
+	// pass through proper auth checks. This is critical for non-relay
+	// (direct P2P) mode where the first peer IS the room authority.
+	if isCreatingRoom && roomPassword != "" {
+		keys := DeriveRoomKeys(roomName, roomPassword, nil)
+		server.CreateRoom(roomName, keys, app.connManager, roomPassword)
+	}
 
 	app.connManager.localPort = server.Port()
 
@@ -392,6 +478,123 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 	}
 
 	return app, nil
+}
+
+// tryConnect attempts to connect to the given peers. It includes the password
+// retry loop from the original flow. Returns true if at least one connection
+// succeeded, false otherwise (in which case the caller should go back to
+// discovery).
+func (app *App) tryConnect(reader *bufio.Reader, peersToConnect []string) bool {
+	if len(peersToConnect) == 0 && (app.isRelay || app.discovery == nil) {
+		// Nothing to connect to — that's fine for room creators and relays.
+		return true
+	}
+
+	if !app.isRelay && app.discovery != nil {
+		connectCtx, connectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		relayPeers, _ := app.discovery.LookupRelays(connectCtx)
+		connectCancel()
+		if len(relayPeers) > 0 {
+			peersToConnect = relayPeers
+		}
+		// If no relays found, keep the originally discovered peers.
+		// Don't discard them — connect directly to those peers instead.
+	}
+	if len(peersToConnect) == 0 {
+		return true
+	}
+
+	connectRoom := app.roomName
+	if app.isPrivate {
+		connectRoom = "(private)"
+	}
+	fmt.Printf("Connecting to room %s%s%s (%d peer(s))...\n", colorCyan, connectRoom, colorReset, len(peersToConnect))
+	connectedCount := 0
+	var lastErr error
+	// First attempt
+	{
+		connectCtx, connectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for _, peerAddr := range peersToConnect {
+			if _, err := app.connManager.GetOrCreate(connectCtx, peerAddr); err != nil {
+				fmt.Printf("Failed to connect to %s: %v\n", peerAddr, err)
+				lastErr = err
+			} else {
+				connectedCount++
+			}
+		}
+		connectCancel()
+	}
+	if connectedCount == 0 && lastErr != nil {
+		if errors.Is(lastErr, ErrBanned) {
+			fmt.Println("\n[System] You are banned from this room. Returning to room selection...")
+			return false
+		}
+		// Connection failed. Offer to retry with a different password.
+		fmt.Printf("\nConnection failed: %v\n", lastErr)
+		if !app.isRelay && len(peersToConnect) > 0 {
+			// Re-prompt for password and retry.
+			for {
+				fmt.Print("\nRe-enter password (or empty to abort): ")
+				newPw, _ := reader.ReadString('\n')
+				newPw = strings.TrimSpace(newPw)
+				if newPw == "" {
+					fmt.Println("Aborted. Returning to room selection...")
+					return false
+				}
+				// Update CM's password and retry the connection.
+				app.roomPassword = newPw
+				app.connManager.roomPassword = newPw
+				// Re-derive keys with new password.
+				keys := DeriveRoomKeys(app.roomName, newPw, nil)
+				if cm := app.connManager; cm != nil {
+					cm.UpdateRoomKeys(app.roomName, newPw, fmt.Sprintf("%x", cm.roomSecret))
+					_ = keys
+				}
+				fmt.Printf("Retrying with new password...\n")
+				connectedCount = 0
+				var firstErr error
+				// New context for each retry
+				connectCtx, connectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				for _, peerAddr := range peersToConnect {
+					_, err := app.connManager.GetOrCreate(connectCtx, peerAddr)
+					if err != nil {
+						fmt.Printf("Failed to connect to %s: %v\n", peerAddr, err)
+						if firstErr == nil {
+							firstErr = err
+						}
+					} else {
+						connectedCount++
+					}
+				}
+				connectCancel()
+				if connectedCount > 0 {
+					break
+				}
+				if firstErr != nil {
+					if errors.Is(firstErr, ErrBanned) {
+						fmt.Println("\n[System] You are banned from this room. Returning to room selection...")
+						return false
+					}
+					if errors.Is(firstErr, ErrWrongPassword) {
+						fmt.Println("\n[System] Wrong password. Please try again.")
+						// Don't exit; let the password retry loop continue
+					}
+					if errors.Is(firstErr, ErrTimeout) {
+						fmt.Println("\n[System] Connection timed out. The relay may be offline or unreachable.")
+						// Don't exit; let the user decide whether to retry
+					}
+				}
+			}
+		} else {
+			fmt.Println("No peers to retry. Returning to room selection...")
+			return false
+		}
+	}
+	if connectedCount > 0 {
+		fmt.Printf("Connected to %s%d%s peer(s)\n", colorGreen, connectedCount, colorReset)
+		return true
+	}
+	return false
 }
 
 func (app *App) runCLI() {
@@ -431,14 +634,59 @@ func (app *App) runCLI() {
 					app.connectTo(addr, msg)
 				}
 
+			case "nick", "name", "alias":
+				if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+					fmt.Println("Usage: /nick <new_alias>")
+				} else {
+					newAlias := strings.TrimSpace(parts[1])
+					oldAlias := app.connManager.GetLocalAlias()
+					app.connManager.SetLocalAlias(newAlias)
+					// Persist so we keep this alias on next launch
+					if err := SaveAlias(app.connManager.GetDeviceID(), newAlias); err != nil {
+						// Non-fatal; just log
+						fmt.Printf("[Warning] could not persist alias: %v\n", err)
+					}
+					fmt.Printf("\n%s\n> ", formatSystemMessage(fmt.Sprintf("You changed your alias from %s to %s", oldAlias, newAlias)))
+					// Notify peers: write a cleartext SYSTEM line to each connected peer.
+					// For relay mode, the relay's handleMessage → SYSTEM: handler
+					// broadcasts to the room. For direct P2P, the peer's readLoop
+					// displays it directly.
+					notify := fmt.Sprintf("SYSTEM:%s is now known as %s\n", oldAlias, newAlias)
+					for _, addr := range app.connManager.ListConnected() {
+						app.connManager.SendRaw(addr, notify)
+					}
+				}
+
 			case "room", "rooms":
 				app.showRoomInfo()
 
 			case "myip":
 				app.showPublicIP()
 
+			case "kick":
+				if len(parts) < 2 {
+					fmt.Println("Usage: /kick <alias>")
+				} else {
+					app.kickPeer(parts[1])
+				}
+
+			case "ban":
+				if len(parts) < 2 {
+					fmt.Println("Usage: /ban <alias>")
+				} else {
+					app.banPeer(parts[1])
+				}
+
+			case "unban":
+				if len(parts) < 2 {
+					fmt.Println("Usage: /unban <alias|address|deviceID>")
+				} else {
+					app.unbanPeer(parts[1])
+				}
+
 			case "exit", "quit", "q", "bye":
 				fmt.Println("Bye")
+				app.userRequestedExit = true
 				return
 
 			default:
@@ -446,6 +694,18 @@ func (app *App) runCLI() {
 			}
 		} else {
 			app.sendToRoom(line)
+		}
+
+		// Check whether we were kicked or disconnected. If so, print a clear
+		// message and return so the caller can go back to discovery.
+		select {
+		case <-app.connManager.kicked:
+			fmt.Println("\n[System] You were removed from the room. Returning to room selection...")
+			return
+		case <-app.connManager.disconnected:
+			fmt.Println("\n[System] Connection to relay lost. Returning to room selection...")
+			return
+		default:
 		}
 
 		fmt.Print("> ")
@@ -462,6 +722,9 @@ func (app *App) sendToRoom(message string) {
 		peers = app.connManager.ListConnected()
 	} else {
 		peers = app.connManager.GetRelayAddrs()
+		if len(peers) == 0 {
+			peers = app.connManager.ListConnected()
+		}
 	}
 
 	if len(peers) == 0 && app.discovery != nil {
@@ -514,6 +777,150 @@ func (app *App) listPeers() {
 	}
 }
 
+func (app *App) kickPeer(alias string) {
+	// If user is the creator (server), handle kick directly
+	if app.isRelay || app.isCreatingRoom {
+		app.server.roomsMu.RLock()
+		var targetPeer *Peer
+		var targetRoom *Room
+		for _, room := range app.server.rooms {
+			room.peersMu.RLock()
+			for _, p := range room.peers {
+				if p.alias == alias {
+					targetPeer = p
+					targetRoom = room
+					break
+				}
+			}
+			room.peersMu.RUnlock()
+			if targetPeer != nil {
+				break
+			}
+		}
+		app.server.roomsMu.RUnlock()
+
+		if targetPeer != nil {
+			// Create a fake requester peer (the creator)
+			requester := &Peer{
+				addr:  "creator",
+				alias: app.connManager.GetLocalAlias(),
+				room:  targetRoom,
+			}
+			app.server.handleKick(requester, alias)
+		} else {
+			fmt.Printf("Peer '%s' not found\n", alias)
+		}
+		return
+	}
+
+	// Otherwise, send KICK message to relay
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	relays := app.connManager.GetRelayAddrs()
+	if len(relays) == 0 {
+		fmt.Println("Not connected to a relay. Use /connect <ip:port> to connect.")
+		return
+	}
+	msg := fmt.Sprintf("KICK:%s", alias)
+	if err := app.connManager.Send(ctx, relays[0], msg); err != nil {
+		fmt.Printf("Failed to send kick: %v\n", err)
+	}
+}
+
+func (app *App) banPeer(alias string) {
+	// If user is the creator (server), handle ban directly
+	if app.isRelay || app.isCreatingRoom {
+		app.server.roomsMu.RLock()
+		var targetPeer *Peer
+		var targetRoom *Room
+		for _, room := range app.server.rooms {
+			room.peersMu.RLock()
+			for _, p := range room.peers {
+				if p.alias == alias {
+					targetPeer = p
+					targetRoom = room
+					break
+				}
+			}
+			room.peersMu.RUnlock()
+			if targetPeer != nil {
+				break
+			}
+		}
+		app.server.roomsMu.RUnlock()
+
+		if targetPeer != nil {
+			// Create a fake requester peer (the creator)
+			requester := &Peer{
+				addr:  "creator",
+				alias: app.connManager.GetLocalAlias(),
+				room:  targetRoom,
+			}
+			app.server.handleBan(requester, alias)
+		} else {
+			fmt.Printf("Peer '%s' not found\n", alias)
+		}
+		return
+	}
+
+	// Otherwise, send BAN message to relay
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	relays := app.connManager.GetRelayAddrs()
+	if len(relays) == 0 {
+		fmt.Println("Not connected to a relay. Use /connect <ip:port> to connect.")
+		return
+	}
+	msg := fmt.Sprintf("BAN:%s", alias)
+	if err := app.connManager.Send(ctx, relays[0], msg); err != nil {
+		fmt.Printf("Failed to send ban: %v\n", err)
+	}
+}
+
+// unbanPeer removes a ban for the given alias, address, or device ID. Only the room owner can unban.
+func (app *App) unbanPeer(target string) {
+	// If user is the creator (server), handle unban directly
+	if app.isRelay || app.isCreatingRoom {
+		app.server.roomsMu.RLock()
+		var firstRoom *Room
+		for _, room := range app.server.rooms {
+			firstRoom = room
+			break
+		}
+		app.server.roomsMu.RUnlock()
+
+		if firstRoom == nil {
+			fmt.Println("No rooms hosted by this server")
+			return
+		}
+
+		// Create a fake requester peer (the creator)
+		requester := &Peer{
+			addr:  "creator",
+			alias: app.connManager.GetLocalAlias(),
+			room:  firstRoom,
+		}
+		app.server.handleUnban(requester, target)
+		return
+	}
+
+	// Otherwise, send UNBAN message to relay
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	relays := app.connManager.GetRelayAddrs()
+	if len(relays) == 0 {
+		fmt.Println("Not connected to a relay. Use /connect <ip:port> to connect.")
+		return
+	}
+	msg := fmt.Sprintf("UNBAN:%s", target)
+	if err := app.connManager.Send(ctx, relays[0], msg); err != nil {
+		fmt.Printf("Failed to send unban: %v\n", err)
+	}
+}
+
 func (app *App) connectTo(addr, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -538,8 +945,12 @@ func (app *App) showHelp() {
 	fmt.Println("  /help            - Show this help")
 	fmt.Println("  /peers           - List connected peers")
 	fmt.Println("  /connect <addr>  - Connect to peer")
+	fmt.Println("  /nick <alias>    - Change your display name")
 	fmt.Println("  /room            - Show room info")
 	fmt.Println("  /myip            - Show your public IP (STUN)")
+	fmt.Println("  /kick <alias>    - Remove a peer from the room (owner only)")
+	fmt.Println("  /ban <alias>     - Remove and block a peer from re-joining (owner only)")
+	fmt.Println("  /unban <alias|address|deviceID> - Lift a ban (owner only)")
 	fmt.Println("  /exit or /quit   - Exit application")
 }
 
@@ -589,16 +1000,18 @@ func resolvePublicIP() string {
 }
 
 func (app *App) shutdown() {
-	if app.upnpCleanup != nil {
-		app.upnpCleanup()
-	}
-	if app.discovery != nil {
-		app.discovery.Shutdown()
-	}
-	if app.connManager != nil {
-		app.connManager.Close()
-	}
-	if app.server != nil {
-		app.server.Close()
-	}
+	app.shutdownOnce.Do(func() {
+		if app.upnpCleanup != nil {
+			app.upnpCleanup()
+		}
+		if app.discovery != nil {
+			app.discovery.Shutdown()
+		}
+		if app.connManager != nil {
+			app.connManager.Close()
+		}
+		if app.server != nil {
+			app.server.Close()
+		}
+	})
 }

@@ -1,16 +1,19 @@
 // multiplex_bench.go – Multiplexed streams: QUIC N independent streams vs TCP N connections
 //
 // Usage (client-only tool – connects to existing tcp_server / quic_server):
-//   go run multiplex_bench.go -proto quic -n 8 [-size 1024] [-addr 192.168.2.5]
-//   go run multiplex_bench.go -proto tcp  -n 8 [-size 1024] [-addr 192.168.2.5]
+//
+//	go run multiplex_bench.go -proto quic -n 8 [-size 1024] [-addr 192.168.2.5]
+//	go run multiplex_bench.go -proto tcp  -n 8 [-size 1024] [-addr 192.168.2.5]
 //
 // QUIC mode: ONE connection (0-RTT after warmup), N independent streams opened
-//   simultaneously.  Packet loss on one stream does NOT stall the others.
+//
+//	simultaneously.  Packet loss on one stream does NOT stall the others.
 //
 // TCP mode:  N parallel goroutines each opening a fresh TCP+TLS connection.
-//   Each connection costs 2 RTTs (TCP SYN + TLS HS) before data can flow.
-//   Under packet loss, any dropped SYN or handshake packet stalls that goroutine
-//   for ≥ 200 ms (Linux TCP RTO minimum).
+//
+//	Each connection costs 2 RTTs (TCP SYN + TLS HS) before data can flow.
+//	Under packet loss, any dropped SYN or handshake packet stalls that goroutine
+//	for ≥ 200 ms (Linux TCP RTO minimum).
 //
 // Set SSLKEYLOGFILE=... so Wireshark can decrypt the traffic.
 package main
@@ -39,6 +42,7 @@ var (
 	flagAddr     = flag.String("addr", "192.168.2.5", "server address")
 	flagTCPPort  = flag.String("tcpport", "9000", "TCP server port")
 	flagQUICPort = flag.String("quicport", "9001", "QUIC server port")
+	flagCSV      = flag.Bool("csv", false, "also emit one machine-readable row: 'CSV,proto,streams,size,min_ms,p50_ms,max_ms,avg_ms,total_elapsed_ms'")
 )
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -318,4 +322,13 @@ func printResults(proto string, n, size int, dialMs float64, results []time.Dura
 	}
 	fmt.Printf("  ── TOTAL_ELAPSED=%v  (wall-clock from first goroutine launch to last response)\n",
 		total)
+
+	if *flagCSV && valid > 0 {
+		msf := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+		// Machine-readable row consumed by bench/multistream_study.sh. The "CSV,"
+		// prefix lets the orchestrator grep it out of the human-readable output.
+		fmt.Printf("CSV,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+			strings.ToLower(proto), n, size,
+			msf(minD), msf(p50), msf(maxD), msf(sum/time.Duration(valid)), msf(total))
+	}
 }
