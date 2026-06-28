@@ -27,11 +27,8 @@ import (
 )
 
 var (
-	// ErrBanned means the device ID or address is in the relay's ban list.
 	ErrBanned = errors.New("banned from room")
-	// ErrWrongPassword means the password didn't match the room's auth key.
 	ErrWrongPassword = errors.New("wrong password")
-	// ErrTimeout means we didn't get SECRET or AUTH:FAILED within the timeout.
 	ErrTimeout = errors.New("connection timed out")
 )
 
@@ -68,8 +65,8 @@ type ConnectionManager struct {
 	// latency plus automatic fallback if one transport is blocked. Off by default.
 	raceTransports bool
 
-	roomKeys   *RoomKeys // always non-nil — derived with roomSecret (nil until SECRET: received)
-	roomSecret []byte    // nil until server sends SECRET: after join; triggers re-keying
+	roomKeys   *RoomKeys
+	roomSecret []byte
 
 	sessionCache tls.ClientSessionCache
 
@@ -80,10 +77,6 @@ type ConnectionManager struct {
 	// Reconnections that present a different certificate are rejected.
 	tofuMu           sync.RWMutex
 	tofuFingerprints map[string]string
-	// tofuPath, when non-empty, is an SSH-style known-peers file that makes the
-	// TOFU pins persistent across restarts and lets them be pre-populated
-	// out-of-band (closing the first-contact blind-trust window). Empty = the
-	// historical in-memory-only behaviour.
 	tofuPath string
 
 	pendingPingsMu sync.Mutex
@@ -105,12 +98,6 @@ type ManagedConnection struct {
 	lastUsed  time.Time
 	mu        sync.Mutex
 
-	// out is a bounded per-connection outbound queue drained by a single
-	// dedicated writer goroutine (writeLoop). Broadcasts enqueue here instead
-	// of writing inline, so a slow peer only backs up its own queue rather than
-	// stalling the relay's broadcast path. The channel is buffered and never
-	// closed: sends after the writer has exited simply fill the buffer and then
-	// drop, which is safe (no send-on-closed-channel panic).
 	out       chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
@@ -125,9 +112,7 @@ type ManagedConnection struct {
 	lastAuthErr error // populated by readLoop when AUTH:FAILED is received
 }
 
-// newManagedConnection builds a ManagedConnection with its outbound queue
-// initialised. The caller must start the writer goroutine via startWriter once
-// the connection is registered.
+// newManagedConnection builds a ManagedConnection, the connection is registered.
 func newManagedConnection(conn PeerConnection, peerAddr string) *ManagedConnection {
 	return &ManagedConnection{
 		conn:      conn,
@@ -139,10 +124,6 @@ func newManagedConnection(conn PeerConnection, peerAddr string) *ManagedConnecti
 	}
 }
 
-// enqueue performs a non-blocking send onto the connection's outbound queue.
-// It returns false (dropping the message) if the queue is full or the
-// connection is shutting down, ensuring one slow peer can never block a
-// broadcast to the rest of the room.
 func (mc *ManagedConnection) enqueue(msg []byte) bool {
 	select {
 	case <-mc.done:
@@ -157,9 +138,6 @@ func (mc *ManagedConnection) enqueue(msg []byte) bool {
 	}
 }
 
-// signalClosed marks the connection's writer goroutine for shutdown. It is
-// idempotent so it is safe to call from both removeConnection and the writer
-// goroutine itself.
 func (mc *ManagedConnection) signalClosed() {
 	if mc.done == nil {
 		return
@@ -168,9 +146,6 @@ func (mc *ManagedConnection) signalClosed() {
 }
 
 func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassword string, isRelay bool, explicitAlias string) *ConnectionManager {
-	// If an explicit alias is provided (e.g. for tests to avoid collisions),
-	// use it directly without reading/writing disk persistence.
-	// Otherwise load the persisted alias, falling back to generating one.
 	deviceID, _ := GetDeviceID()
 	var alias string
 	if explicitAlias != "" {
@@ -207,11 +182,6 @@ func NewConnectionManager(localPort int, roomName string, useTCP bool, roomPassw
 	return cm
 }
 
-// UpdateRoomKeys re-derives room keys when the server sends a rotated secret.
-// This is called when the client receives a SECRET: message after joining.
-// For authenticated rooms, authKey is re-derived via argon2.IDKey(password, roomName)
-// so all authenticated peers have the SAME authKey (enabling E2EE interoperability).
-// For unauthenticated rooms, authKey stays as roomName-derived (from nil secret).
 func (cm *ConnectionManager) UpdateRoomKeys(roomName, roomPassword string, secretHex string) error {
 	log.Printf("[DEBUG] UpdateRoomKeys: roomName=%s, password=%s, secretHex=%s", roomName, roomPassword, secretHex)
 	secret, err := hex.DecodeString(secretHex)
@@ -221,9 +191,6 @@ func (cm *ConnectionManager) UpdateRoomKeys(roomName, roomPassword string, secre
 	log.Printf("[DEBUG] UpdateRoomKeys: secret=%x", secret)
 	cm.mu.Lock()
 	cm.roomSecret = secret
-	// For authenticated rooms (roomPassword != ""): derive authKey via argon2.IDKey(password, roomName)
-	// so all authenticated peers share the same authKey as the server's ownerAuthKey.
-	// For unauthenticated rooms: authKey remains nil-derived (from initial DeriveRoomKeys).
 	var authKey []byte
 	if roomPassword != "" {
 		authKey = argon2.IDKey([]byte(roomPassword), []byte(roomName), 1, 64*1024, 4, 32)
@@ -250,10 +217,6 @@ func (cm *ConnectionManager) UpdateRoomKeys(roomName, roomPassword string, secre
 	return nil
 }
 
-// WaitForRoomKeysUpdate blocks for up to timeout until the room secret is non-nil
-// AND differs from the provided previousSecret. Pass the secret known to be current;
-// the function returns when a NEW secret has been applied. Used by tests to
-// synchronize after a key rotation.
 func (cm *ConnectionManager) WaitForRoomKeysUpdate(previousSecret []byte, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -269,17 +232,6 @@ func (cm *ConnectionManager) WaitForRoomKeysUpdate(previousSecret []byte, timeou
 	return false
 }
 
-// checkAndPin implements Trust-On-First-Use (TOFU) for peer certificates, with
-// optional persistence. On first contact with peerAddr it records ("pins") the
-// certificate fingerprint; any later connection presenting a different
-// fingerprint is rejected as a possible man-in-the-middle. When a known-peers
-// file is configured (LoadKnownPeers), a freshly observed pin is also written
-// to disk so it survives restarts.
-//
-// Pre-populating that file out-of-band (e.g. exchanging fingerprints over a
-// trusted channel) means the very first connection is verified against a value
-// the operator supplied rather than trusted on sight — which closes the classic
-// TOFU first-contact blind-trust window.
 func (cm *ConnectionManager) checkAndPin(peerAddr, fpHex string) error {
 	cm.tofuMu.Lock()
 	known, ok := cm.tofuFingerprints[peerAddr]
@@ -305,10 +257,6 @@ func (cm *ConnectionManager) checkAndPin(peerAddr, fpHex string) error {
 	return nil
 }
 
-// LoadKnownPeers configures a persistent TOFU store at path and loads any pins
-// already in it. The format is one "addr sha256hex" pair per line ('#' comment
-// lines and blanks are ignored), mirroring SSH's known_hosts. A missing file is
-// fine (a new store is created lazily on the first pin).
 func (cm *ConnectionManager) LoadKnownPeers(path string) error {
 	cm.tofuPath = path
 
@@ -402,12 +350,6 @@ func (cm *ConnectionManager) dialQUICPeer(ctx context.Context, peerAddr string, 
 	return &QuicConnectionWrapper{Stream: stream, Conn: conn}, nil
 }
 
-// raceDial dials QUIC and TCP concurrently and returns the first connection to
-// complete its handshake, cancelling and closing the loser. This yields
-// min(QUIC, TCP) connection-setup latency and transparently falls back to TCP
-// when UDP/QUIC is blocked (and vice-versa) — a Happy-Eyeballs (RFC 8305) style
-// adaptive transport. Both dials share the same TLS config; because the relay
-// presents the same certificate on QUIC and TCP, TOFU pinning is consistent.
 func (cm *ConnectionManager) raceDial(ctx context.Context, peerAddr string, tlsConf *tls.Config) (PeerConnection, error) {
 	type result struct {
 		pc  PeerConnection
@@ -690,26 +632,12 @@ func (cm *ConnectionManager) getOrCreate(ctx context.Context, peerAddr string) (
 	}
 }
 
-// writeLoop is the single goroutine that owns all writes to a connection. It
-// drains the outbound queue and writes each message under mc.mu (serialising
-// with health-check PING writes, which is required for QUIC streams where
-// concurrent writes are unsafe). A write error or a shutdown signal tears the
-// connection down. Centralising writes here means broadcastToRoom never blocks
-// on a slow peer's socket.
 func (cm *ConnectionManager) writeLoop(mc *ManagedConnection) {
 	for {
 		select {
 		case <-mc.done:
 			return
 		case msg := <-mc.out:
-			// Coalesce any further already-queued messages into a single write.
-			// Under high broadcast fan-out (n~1000) a peer's outbound queue often
-			// holds several messages at once; writing them in one call cuts the
-			// number of userspace QUIC stream writes (and syscalls), which is the
-			// dominant per-message cost for a userspace transport at scale. msg and
-			// the queued slices are SHARED broadcast buffers, so we copy their bytes
-			// into a fresh batch instead of appending in place (which would corrupt
-			// other peers' data and race).
 			batch := make([]byte, 0, len(msg)*2)
 			batch = append(batch, msg...)
 		coalesce:
@@ -732,10 +660,6 @@ func (cm *ConnectionManager) writeLoop(mc *ManagedConnection) {
 	}
 }
 
-// Enqueue queues a message for asynchronous delivery to peerAddr via that
-// connection's dedicated writer goroutine. It returns false if the peer is
-// unknown or its outbound queue is full (the message is dropped). This is the
-// non-blocking path the relay uses to broadcast.
 func (cm *ConnectionManager) Enqueue(peerAddr string, msg []byte) bool {
 	cm.mu.RLock()
 	mc, ok := cm.connections[peerAddr]
@@ -753,9 +677,6 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			// If we were kicked, cm.kicked is already closed. Otherwise, signal
-			// that the connection was lost so the CLI loop can return to
-			// room selection.
 			select {
 			case <-cm.kicked:
 				// kick path already handled
@@ -801,15 +722,12 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 				mc.lastAuthErr = &authError{kind: ErrWrongPassword, reason: reason}
 			}
 			mc.mu.Unlock()
-			// Remove the connection from the map FIRST, then signal getOrCreate.
-			// This ordering ensures that when getOrCreate's Wait() unblocks and
-			// checks cm.connections, the map entry is already gone.
 			cm.removeConnection(mc.peerAddr)
 			mc.secretDoneOnce.Do(mc.secretReady.Done)
 			return
 		}
 
-		// SECRET: — server sends the current room secret (hex encoded) after a key rotation.
+		// server sends the current room secret (hex encoded) after a key rotation.
 		// The client re-derives room keys with the new secret so subsequent messages
 		// use the updated encryption. Peers who were kicked/banned do not receive this
 		// message and cannot decrypt new messages.
@@ -817,10 +735,6 @@ func (cm *ConnectionManager) readLoop(mc *ManagedConnection) {
 			secretHex := strings.TrimPrefix(line, "SECRET:")
 			secretHex = strings.TrimSpace(secretHex)
 			if secretHex != "" {
-				// Read cm.roomName and cm.roomPassword while holding the lock,
-				// but release the lock before calling UpdateRoomKeys to avoid
-				// deadlock (UpdateRoomKeys needs cm.mu.Lock which is incompatible
-				// with the cm.mu.RLock we already hold).
 				cm.mu.RLock()
 				roomName := cm.roomName
 				roomPassword := cm.roomPassword

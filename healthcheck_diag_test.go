@@ -9,7 +9,7 @@ import (
 )
 
 // TestHealthCheckWithRealQUIC tests the full PING/PONG health check loop
-// using real QUIC connections and verifies no false-positive disconnects.
+// using QUIC connections and verifies no false-positive disconnects.
 func TestHealthCheckWithRealQUIC(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping long-running test in short mode")
@@ -59,8 +59,7 @@ func TestHealthCheckWithRealQUIC(t *testing.T) {
 	initialRelayPeerCount := len(relayPeers)
 	maxDisconnects := 0
 
-	// Now let the healthCheck run for a while
-	// Send a message every 3 seconds to simulate chat activity
+	// let the healthCheck run and send messages to simulate chat activity
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)

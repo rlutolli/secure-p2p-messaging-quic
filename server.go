@@ -518,7 +518,7 @@ func (s *Server) CreateRoom(roomName string, keys *RoomKeys, cm *ConnectionManag
 		hasAuth:        true,
 		keys:           keys,
 		roomSecret:     roomSecret,
-		ownerAddr:      "", // filled when the first peer joins
+		ownerAddr:      "",
 		peers:          make(map[string]*Peer),
 		createdLocally: true,
 	}
@@ -538,9 +538,6 @@ func (s *Server) CreateRoom(roomName string, keys *RoomKeys, cm *ConnectionManag
 		HMACKey: hmacKey,
 	}
 	s.rooms[roomName] = room
-	// Update the local ConnectionManager's keys so the room creator can send
-	// encrypted messages immediately. Without this, cm.roomKeys.EncKey is nil
-	// because the creator never receives a SECRET message from anyone.
 	if cm != nil {
 		log.Printf("[DEBUG] CreateRoom: calling cm.UpdateRoomKeys")
 		cm.UpdateRoomKeys(roomName, roomPassword, hex.EncodeToString(roomSecret))
@@ -561,11 +558,6 @@ func (s *Server) joinRoom(peer *Peer, roomName string, keys *RoomKeys, hasAuth b
 			peers:      make(map[string]*Peer),
 		}
 		s.rooms[roomName] = room
-		// For authenticated rooms: store the owner's authKey and derive EncKey/HMACKey
-		// from HKDF(ownerAuthKey, roomSecret). This ensures all authenticated peers
-		// (who all receive the same room secret) have the SAME E2EE keys.
-		// For unauthenticated rooms: re-derive from the room secret (HKDF with
-		// roomName-derived authKey) so peers get matching keys.
 		if hasAuth {
 			room.ownerAuthKey = keys.AuthKey // preserve owner's authKey
 			// Derive EncKey and HMACKey from HKDF(ownerAuthKey, roomSecret)
@@ -585,8 +577,7 @@ func (s *Server) joinRoom(peer *Peer, roomName string, keys *RoomKeys, hasAuth b
 			room.keys = DeriveRoomKeys(roomName, "", room.roomSecret)
 		}
 	}
-	// IMPORTANT: for existing rooms, do NOT overwrite room.keys. The room's keys were
-	// set at room creation and should remain unchanged.
+
 	s.roomsMu.Unlock()
 
 	room.peersMu.Lock()
@@ -598,11 +589,6 @@ func (s *Server) joinRoom(peer *Peer, roomName string, keys *RoomKeys, hasAuth b
 	}
 	room.peersMu.Unlock()
 
-	// Send the current room secret to the joining peer as plaintext. The secret alone
-	// (without Argon2id derivation) is useless to attackers. We do NOT rotate on join —
-	// rotation only happens on kick/ban to maintain forward secrecy. This avoids
-	// overwriting room.keys (which preserves authenticated room keys derived with
-	// the room password).
 	secretHex := hex.EncodeToString(room.roomSecret)
 	if _, err := peer.conn.Write([]byte(fmt.Sprintf("SECRET:%s\n", secretHex))); err != nil {
 		log.Printf("[Server] Failed to send room secret to %s: %v", peer.alias, err)
@@ -618,18 +604,9 @@ func (s *Server) joinRoom(peer *Peer, roomName string, keys *RoomKeys, hasAuth b
 	log.Printf("[Server] Peer %s (%s) joined room '%s' (owner: %s)", peer.alias, peer.addr, roomName, room.ownerAddr)
 }
 
-// rotateRoomSecret generates a new room secret, re-derives the room keys, and
-// sends the new secret to all remaining peers as plaintext. The secret alone is
-// useless to attackers without the Argon2id derivation (which requires the room
-// password). Peers who have been kicked/banned are no longer in room.peers and
-// cannot receive the new secret.
 func (s *Server) rotateRoomSecret(room *Room) {
 	room.peersMu.Lock()
 	room.roomSecret = GenerateRoomSecret()
-	// Re-derive room keys with the new secret. For authenticated rooms,
-	// preserve room.ownerAuthKey (derived from the room password) so all
-	// authenticated peers continue to derive matching E2EE keys. For
-	// unauthenticated rooms, authKey is derived from the room name.
 	var authKey []byte
 	if room.hasAuth && len(room.ownerAuthKey) > 0 {
 		authKey = room.ownerAuthKey
@@ -664,13 +641,7 @@ func (s *Server) rotateRoomSecret(room *Room) {
 	}
 	log.Printf("[Server] Room '%s' keys rotated — %d peer(s) notified", room.name, notified)
 
-	// Update the creator's own ConnectionManager with the new secret so the
-	// creator's outgoing messages use the rotated keys. Without this, the
-	// creator (server) retains the old roomSecret/HMACKey, and recipients
-	// (who received the SECRET above) reject the creator's messages.
 	if s.connManager != nil {
-		// Pass roomPassword="" to preserve the CM's existing authKey
-		// (authKey does not change during rotation — only roomSecret changes).
 		if err := s.connManager.UpdateRoomKeys(room.name, "", newSecretHex); err != nil {
 			log.Printf("[Server] rotateRoomSecret: failed to update local CM keys: %v", err)
 		} else {
@@ -680,7 +651,7 @@ func (s *Server) rotateRoomSecret(room *Room) {
 }
 
 // handleKick removes a peer from the room and rotates room keys so the evicted
-// peer cannot decrypt subsequent messages. Only the room owner can kick.
+// peer cannot decrypt subsequent messages, only the room owner can kick.
 func (s *Server) handleKick(requester *Peer, targetAlias string) {
 	room := requester.room
 
@@ -711,20 +682,12 @@ func (s *Server) handleKick(requester *Peer, targetAlias string) {
 	delete(room.peers, targetAddr)
 	room.peersMu.Unlock()
 
-	// Send KICKED notification to the evicted peer BEFORE closing the connection.
-	// This gives them a clear message about why they were disconnected.
 	kickMsg := fmt.Sprintf("SYSTEM:You were kicked from room '%s' by the owner\n", room.name)
 	if _, err := targetPeer.conn.Write([]byte(kickMsg)); err != nil {
 		log.Printf("[Server] kick write error: %v", err)
 	}
-
-	// Give the kicked peer a moment to receive the notification before closing
 	time.Sleep(200 * time.Millisecond)
-
-	// Rotate keys AFTER removing from peers so the evicted peer doesn't receive the new secret.
 	s.rotateRoomSecret(room)
-
-	// Close the evicted peer's connection.
 	targetPeer.conn.Close()
 	if s.connManager != nil {
 		s.connManager.removeConnection(targetAddr)
@@ -807,8 +770,6 @@ func (s *Server) handleBan(requester *Peer, targetAlias string) {
 	log.Printf("[Server] %s banned %s (%s) from room '%s'", requester.alias, targetAlias, targetAddr, room.name)
 }
 
-// handleUnban removes a ban entry from the ban list. Only the room owner can unban.
-// target can be an address (ip:port), an alias, or a device ID.
 func (s *Server) handleUnban(requester *Peer, target string) {
 	room := requester.room
 	if room == nil {
@@ -835,14 +796,10 @@ func (s *Server) handleUnban(requester *Peer, target string) {
 
 	s.banListMu.Lock()
 	removedCount := 0
-
-	// 1. Try direct key match (address, or explicit device:/alias: prefix)
 	if _, ok := s.banList[target]; ok {
 		delete(s.banList, target)
 		removedCount++
 	}
-
-	// 2. If target is a bare alias (no device:/alias: prefix), also remove
 	//    the device:<id> entry via the reverse mapping.
 	if !strings.HasPrefix(target, "device:") && !strings.HasPrefix(target, "alias:") {
 		// Remove alias: entry if present

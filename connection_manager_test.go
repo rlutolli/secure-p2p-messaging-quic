@@ -122,9 +122,6 @@ func TestConnectionManagerSend(t *testing.T) {
 	cm.RegisterIncoming("127.0.0.1:1234", mock)
 
 	// Manually set up room keys to simulate receiving a SECRET from a relay.
-	// Without a real relay connection, cm.roomKeys.EncKey would be nil and
-	// Send() would fail to encrypt.
-	// Use a dummy secret for testing.
 	dummySecret := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	if err := cm.UpdateRoomKeys("testroom", "", dummySecret); err != nil {
 		t.Fatalf("UpdateRoomKeys failed: %v", err)
@@ -139,7 +136,7 @@ func TestConnectionManagerSend(t *testing.T) {
 	}
 
 	written := string(mock.getWritten())
-	// E2EE is always active — message should be 4-field encrypted format:
+	// E2EE is always active, message should be 4-field encrypted format:
 	// FROM:<alias>|<payload>|<nonce>|<hmac>\n
 	if !strings.HasPrefix(written, "FROM:") {
 		t.Errorf("expected FROM: prefix, got %q", written)
@@ -195,7 +192,7 @@ func TestConnectionManagerRelayTracking(t *testing.T) {
 func TestConnectionManagerNonRelayOnlySendsToRelay(t *testing.T) {
 	t.Parallel()
 
-	// Set up a proper relay server (alice) with real TCP listener
+	// Set up a proper relay server (alice) with TCP listener
 	aliceCM := NewConnectionManager(0, "testroom", true, "", true, "NonRelaySendsToRelay-Alice")
 	defer aliceCM.Close()
 
@@ -244,12 +241,6 @@ func TestConnectionManagerNonRelayOnlySendsToRelay(t *testing.T) {
 	if !bobCM.WaitForRoomKeysUpdate(nil, 2*time.Second) {
 		t.Fatal("bobCM never received room secret after joining")
 	}
-
-	// Verify that non-relay peers (other registered connections) don't receive
-	// messages sent to the relay address. We verify by checking that when we
-	// send to aliceAddr (the relay), only the relay connection receives data.
-	// Since bob has no other registered peers, we just verify the relay connection
-	// IS used (getOrCreate succeeded) and the connection is properly established.
 
 	// Verify bob's connection to relay is properly established
 	if bobMC == nil {

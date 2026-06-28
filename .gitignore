@@ -67,3 +67,19 @@ graphify-out/
 
 # Report (thesis) — excluded from code submission
 report/
+
+# AI session logs and scratch files
+session-ses_*.md
+analyze_*.py
+
+# AI-generated planning and debug docs
+docs/debug-request-for-ai.md
+docs/dissertation-outline*.md
+docs/research-prompt-*.md
+docs/subagent-docs/
+docs/quic_1000.json
+docs/tcp_1000.json
+
+# Editor/AI tool directories
+.kiro/
+.opencode/

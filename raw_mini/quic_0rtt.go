@@ -116,11 +116,6 @@ func runClient(addr, port string) {
 
 	dest := net.JoinHostPort(addr, port)
 
-	// ------------------------------------------------------------------
-	// Warm-up: one full 1-RTT connection to populate the session cache.
-	// Without this, the first DialAddrEarly has nothing to resume from
-	// and falls back to a full handshake.
-	// ------------------------------------------------------------------
 	fmt.Println("--- Warm-up (establishing session) ---")
 	warmupConn, err := quic.DialAddr(context.Background(), dest, tlsConf, nil)
 	if err != nil {

@@ -95,9 +95,6 @@ type App struct {
 	isCreatingRoom bool
 	upnpCleanup    func()
 	externalAddr   string
-	// userRequestedExit is set to true when the user types /exit or /quit.
-	// runCLI returns, and the main loop checks this flag to decide whether
-	// to break (exit program) or continue (go back to discovery).
 	userRequestedExit bool
 	// shutdownOnce ensures shutdown is idempotent across multiple calls.
 	shutdownOnce sync.Once
@@ -130,9 +127,7 @@ type roomSelection struct {
 	quit           bool
 }
 
-// promptRoomSelection runs the LAN discovery scan and shows the interactive
-// room-selection menu. It returns the user's chosen room details or sets
-// quit=true when the user selects 'q'.
+// promptRoomSelection runs the LAN discovery
 func promptRoomSelection(reader *bufio.Reader, discPort int) roomSelection {
 	done := make(chan bool, 1)
 	go runSpinner(done, "Scanning LAN for rooms")
@@ -194,17 +189,13 @@ func promptRoomSelection(reader *bufio.Reader, discPort int) roomSelection {
 				result.roomName = rooms[idx-1].Name
 				result.peersToConnect = rooms[idx-1].Peers
 				result.isPrivate = false
-				// Always prompt for a password when joining. The [password protected]
-				// discovery label is unreliable (non-relay peers don't advertise it),
-				// but the server will correctly reject incorrect passwords.
 				fmt.Print("Enter room password (leave empty if none): ")
 				password, _ := reader.ReadString('\n')
 				result.roomPassword = strings.TrimSpace(password)
 			} else {
 				result.roomName = choice
 				result.isPrivate = false
-				// Treating a typed name as a new room — prompt for password
-				// just like the "n" (create new) path does.
+				// Treating a typed name as a new room
 				fmt.Print("Set a password? (leave empty for none): ")
 				pw, _ := reader.ReadString('\n')
 				result.roomPassword = strings.TrimSpace(pw)
@@ -225,8 +216,6 @@ func promptRoomSelection(reader *bufio.Reader, discPort int) roomSelection {
 			result.roomName = "default"
 		}
 		result.isPrivate = strings.ToLower(result.roomName) == "private"
-		// Always offer the password prompt, even for private rooms. The user
-		// can leave it empty for no password — it's optional either way.
 		fmt.Print("Set a password? (leave empty for none): ")
 		pw, _ := reader.ReadString('\n')
 		result.roomPassword = strings.TrimSpace(pw)
@@ -285,7 +274,7 @@ func main() {
 			// WAN remedy: some paths drop ECN-marked datagrams.
 			os.Setenv("QUIC_GO_DISABLE_ECN", "true")
 		case "--race":
-			// Happy-Eyeballs style: dial QUIC and TCP in parallel, keep the winner.
+			// Happy-Eyeballs style: dial QUIC and TCP in parallel
 			raceMode = true
 		}
 	}
@@ -374,10 +363,6 @@ func main() {
 			}()
 		}
 
-		// Only require at least one connection if we were trying to JOIN an existing
-		// room (i.e. we're not a relay and didn't create the room). Room creators
-		// and relays don't need outgoing connections at startup — they wait for
-		// incoming ones.
 		isJoiner := !isRelay && !isCreatingRoom
 		hasPeer := len(app.connManager.ListConnected()) > 0
 		if hasPeer || !isJoiner {
@@ -417,8 +402,6 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 
 	app.connManager = NewConnectionManager(0, roomName, useTCP, roomPassword, isRelay, "")
 
-	// Optional persistent TOFU store (SSH-style known_hosts). Off by default so
-	// behaviour and benchmarks are unchanged unless P2P_KNOWN_PEERS is set.
 	if kp := os.Getenv("P2P_KNOWN_PEERS"); kp != "" {
 		if err := app.connManager.LoadKnownPeers(kp); err != nil {
 			log.Printf("[TOFU] could not load known peers from %s: %v", kp, err)
@@ -433,9 +416,6 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 		fmt.Printf("\n%s\n> ", formatSystemMessage(message))
 	}
 
-	// relayPort of 0 binds to an OS-assigned ephemeral port (historical
-	// default). A fixed port keeps the relay reachable at a known address
-	// across restarts, which benchmark orchestration relies on.
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", relayPort)
 	server, err := NewServer(bindAddr, onMessage, onSystemMessage, app.connManager)
 	if err != nil {
@@ -443,9 +423,6 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 	}
 	app.server = server
 
-	// Pre-create room in the local server so incoming JOINs from peers
-	// pass through proper auth checks. This is critical for non-relay
-	// (direct P2P) mode where the first peer IS the room authority.
 	if isCreatingRoom && roomPassword != "" {
 		keys := DeriveRoomKeys(roomName, roomPassword, nil)
 		server.CreateRoom(roomName, keys, app.connManager, roomPassword)
@@ -480,13 +457,8 @@ func initializeApp(roomName string, isPrivate bool, useTCP bool, discPort int, r
 	return app, nil
 }
 
-// tryConnect attempts to connect to the given peers. It includes the password
-// retry loop from the original flow. Returns true if at least one connection
-// succeeded, false otherwise (in which case the caller should go back to
-// discovery).
 func (app *App) tryConnect(reader *bufio.Reader, peersToConnect []string) bool {
 	if len(peersToConnect) == 0 && (app.isRelay || app.discovery == nil) {
-		// Nothing to connect to — that's fine for room creators and relays.
 		return true
 	}
 
@@ -497,8 +469,6 @@ func (app *App) tryConnect(reader *bufio.Reader, peersToConnect []string) bool {
 		if len(relayPeers) > 0 {
 			peersToConnect = relayPeers
 		}
-		// If no relays found, keep the originally discovered peers.
-		// Don't discard them — connect directly to those peers instead.
 	}
 	if len(peersToConnect) == 0 {
 		return true
@@ -643,14 +613,10 @@ func (app *App) runCLI() {
 					app.connManager.SetLocalAlias(newAlias)
 					// Persist so we keep this alias on next launch
 					if err := SaveAlias(app.connManager.GetDeviceID(), newAlias); err != nil {
-						// Non-fatal; just log
+						// Non-fatal
 						fmt.Printf("[Warning] could not persist alias: %v\n", err)
 					}
 					fmt.Printf("\n%s\n> ", formatSystemMessage(fmt.Sprintf("You changed your alias from %s to %s", oldAlias, newAlias)))
-					// Notify peers: write a cleartext SYSTEM line to each connected peer.
-					// For relay mode, the relay's handleMessage → SYSTEM: handler
-					// broadcasts to the room. For direct P2P, the peer's readLoop
-					// displays it directly.
 					notify := fmt.Sprintf("SYSTEM:%s is now known as %s\n", oldAlias, newAlias)
 					for _, addr := range app.connManager.ListConnected() {
 						app.connManager.SendRaw(addr, notify)

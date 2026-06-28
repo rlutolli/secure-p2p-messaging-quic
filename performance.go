@@ -24,23 +24,8 @@ const (
 	ConnectTimeout = 5 * time.Second
 	SendTimeout    = 2 * time.Second
 
-	// MaxConcurrentHandshakes bounds how many inbound connections may be in the
-	// setup phase (TLS handshake / first QUIC stream accept) at once. This
-	// smooths out a thundering herd of peers connecting simultaneously so the
-	// relay does not thrash on crypto or exhaust the accept queue.
 	MaxConcurrentHandshakes = 256
-	// HandshakeSetupTimeout caps how long the relay waits for a freshly accepted
-	// connection to complete setup before dropping it, so a stalled client
-	// cannot hold a setup slot indefinitely.
 	HandshakeSetupTimeout = 30 * time.Second
-
-	// OutboundQueueSize bounds the per-connection outbound message queue. Each
-	// ManagedConnection is drained by a single dedicated writer goroutine, so a
-	// slow or stalled peer only backs up its own queue instead of blocking the
-	// relay's broadcast path (which previously ran on the per-peer reader
-	// goroutine and starved PING/PONG processing, triggering false-positive
-	// health-check disconnects at high peer counts). When a peer's queue is
-	// full its message is dropped rather than blocking every other peer.
 	OutboundQueueSize = 1024
 
 	recommendedUDPBufSize = 7 * 1024 * 1024
