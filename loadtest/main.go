@@ -190,12 +190,54 @@ func (e *errorStats) report(label string) {
 	}
 }
 
-// dialOnce performs a single dial using the configured protocol.
+// dialOnce performs a single dial using the configured protocol. "race" dials
+// QUIC and TCP in parallel and keeps whichever completes its handshake first
+// (Happy-Eyeballs style), giving min(QUIC,TCP) setup latency plus automatic
+// fallback when one transport is blocked.
 func dialOnce(ctx context.Context, cfg config) (io.ReadWriteCloser, error) {
-	if cfg.proto == "quic" {
+	switch cfg.proto {
+	case "quic":
 		return dialQUIC(ctx, cfg.target)
+	case "tcp":
+		return dialTCP(ctx, cfg.target)
+	case "race":
+		conn, _, err := dialRace(ctx, cfg.target)
+		return conn, err
 	}
 	return dialTCP(ctx, cfg.target)
+}
+
+// dialRace dials QUIC and TCP concurrently and returns the first connection to
+// finish its handshake, cancelling and closing the loser. It reports which
+// transport won so callers can record the winning protocol.
+func dialRace(ctx context.Context, target string) (io.ReadWriteCloser, string, error) {
+	type result struct {
+		conn  io.ReadWriteCloser
+		proto string
+		err   error
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	ch := make(chan result, 2)
+	go func() { c, e := dialQUIC(rctx, target); ch <- result{c, "quic", e} }()
+	go func() { c, e := dialTCP(rctx, target); ch <- result{c, "tcp", e} }()
+
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err == nil {
+			cancel() // stop the slower dial
+			// Close the loser if/when it still arrives, in the background.
+			go func() {
+				if lr := <-ch; lr.conn != nil {
+					lr.conn.Close()
+				}
+			}()
+			return r.conn, r.proto, nil
+		}
+		lastErr = r.err
+	}
+	cancel()
+	return nil, "", lastErr
 }
 
 // dialWithRetry dials the target, retrying transient failures up to
@@ -391,8 +433,8 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if cfg.proto != "quic" && cfg.proto != "tcp" {
-		fmt.Fprintf(os.Stderr, "Error: -proto must be 'quic' or 'tcp', got %q\n", cfg.proto)
+	if cfg.proto != "quic" && cfg.proto != "tcp" && cfg.proto != "race" {
+		fmt.Fprintf(os.Stderr, "Error: -proto must be 'quic', 'tcp', or 'race', got %q\n", cfg.proto)
 		os.Exit(1)
 	}
 	if cfg.n < 2 && (cfg.mode == "scale" || cfg.mode == "throughput" || cfg.mode == "latency") {

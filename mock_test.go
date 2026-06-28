@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -65,4 +66,19 @@ func (m *mockConn) isClosed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closed
+}
+
+// drainSECRET removes any "SECRET:<hex>\n" line from the written buffer.
+// Used when the server sends room secrets that the test mock doesn't process.
+func (m *mockConn) drainSECRET() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := string(m.written)
+	idx := strings.Index(s, "SECRET:")
+	if idx >= 0 {
+		end := strings.Index(s[idx:], "\n")
+		if end >= 0 {
+			m.written = []byte(s[:idx] + s[idx+end+1:])
+		}
+	}
 }

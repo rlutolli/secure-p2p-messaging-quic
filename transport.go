@@ -28,12 +28,13 @@ func (w *QuicConnectionWrapper) Write(p []byte) (n int, err error) {
 }
 
 func (w *QuicConnectionWrapper) Close() error {
-	serr := w.Stream.Close()
-	cerr := w.Conn.CloseWithError(0, "")
-	if serr != nil {
-		return serr
-	}
-	return cerr
+	// Close the stream gracefully. This sends a FIN and reliably delivers
+	// all buffered data. We intentionally do NOT close the QUIC connection
+	// with CloseWithError here — that would send a CONNECTION_CLOSE frame
+	// which can cause unacknowledged stream data to be lost (RFC 9000 §10.2.2).
+	// The QUIC connection will be cleaned up by idle timeout (60s) or when
+	// the peer closes its side.
+	return w.Stream.Close()
 }
 
 func (w *QuicConnectionWrapper) RemoteAddr() net.Addr {

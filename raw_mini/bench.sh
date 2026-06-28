@@ -86,8 +86,6 @@ printf "  Interface: %s\n\n" "$IFACE"
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 1 – LAN Baseline (no shaping)
 # Measures FULL handshake + echo on a fresh connection per size.
-# QUIC uses 0-RTT (after a warmup) while TCP pays a full TCP+TLS handshake.
-# Even on clean LAN, QUIC's 0-RTT eliminates handshake latency.
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 1: LAN Baseline  [no shaping – QUIC 0-RTT vs TCP full handshake]"
 netem_apply ""
@@ -105,15 +103,6 @@ netem_clear
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 2 – WAN Latency  (delay 40 ms)
 # Measures FULL handshake + echo.  Timer starts before Dial.
-#
-# TCP+TLS: TCP SYN (1 RTT) + TLS 1.3 ClientHello/ServerHello (1 RTT) + data (1 RTT)
-#          → DIAL_MS ≈ 80   TOTAL_MS ≈ 120 ms
-#
-# QUIC:    QUIC Initial + Handshake coalesced into 1 RTT → DIAL_MS ≈ 40
-#          Then data echo → TOTAL_MS ≈ 80 ms
-#
-# QUIC saves 1 RTT (40 ms) on handshake alone.  With 0-RTT on reconnect
-# (see Scenario 6) the saving grows to 2 RTTs.
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 2: WAN Handshake  [delay 40ms – QUIC 1-RTT HS vs TCP 2-RTT HS]"
 netem_apply "delay 40ms"
@@ -129,14 +118,6 @@ netem_clear
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 3 – Lossy Link  (delay 20 ms, 1% loss)
 # Persistent connection, full size sweep.
-#
-# Under packet loss on a persistent connection:
-#   TCP:  retransmit timer (RTO) ≥ 200 ms on Linux → a single dropped data
-#         segment or ACK stalls ALL subsequent data for ≥ 200 ms.
-#   QUIC: loss detected via packet-number gaps in 1.5×SRTT ≈ 30 ms; only the
-#         affected stream-frame is retransmitted; others are unblocked.
-#
-# With enough messages, loss events become visible in RTT spikes.
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 3: Lossy Link  [delay 20ms loss 1% – QUIC fast recovery vs TCP RTO 200ms]"
 netem_apply "delay 20ms loss 1%"
@@ -152,7 +133,6 @@ netem_clear
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 4 – High Loss  (delay 30 ms, 3% loss)
 # Same as Scenario 3 but with 3% loss: loss events occur in nearly every run,
-# making the TCP RTO stall clearly visible in the raw RTT numbers.
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 4: High Loss  [delay 30ms loss 3% – TCP RTO stalls vs QUIC NACK recovery]"
 netem_apply "delay 30ms loss 3%"
@@ -168,16 +148,8 @@ netem_clear
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 5 – Multiplexed Streams  (delay 20 ms, 1% loss)
 # 8 goroutines launched simultaneously.
-#
 # QUIC: 1 shared connection (0-RTT after warmup), 8 independent streams.
-#   - Connection setup cost paid ONCE (0-RTT ≈ instant via DialAddrEarly).
-#   - A lost packet on stream i does NOT stall streams j≠i.
-#   - TOTAL_ELAPSED ≈ 1 RTT of data (20–50 ms under 1% loss).
-#
 # TCP: 8 parallel goroutines, each with a full TCP+TLS connection.
-#   - Each goroutine pays 2 RTTs for setup + 1 RTT data = 60 ms minimum.
-#   - Any goroutine whose SYN/TLS packet is dropped stalls ≥ 200 ms.
-#   - TOTAL_ELAPSED = max(individual) = often 200 ms+ under 1% loss.
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 5: Multiplex  [delay 20ms loss 1% – QUIC N independent streams vs TCP N conns]"
 netem_apply "delay 20ms loss 1%"
@@ -193,18 +165,6 @@ netem_clear
 # ─────────────────────────────────────────────────────────────────────────────
 # SCENARIO 6 – Reconnection Burst  (delay 40 ms)
 # 5 short-lived connections made sequentially.  Each sends one message.
-#
-# TCP+TLS: every connection costs 3 RTTs (no improvement on reconnect because
-#   Go's crypto/tls does NOT support TLS 1.3 0-RTT early data, and the TCP SYN
-#   consumes 1 RTT before any TLS can begin).
-#   Per-conn TOTAL_MS ≈ 120 ms  →  5-conn SUM ≈ 600 ms
-#
-# QUIC:
-#   Conn 1 : DialAddr (full 1-RTT QUIC handshake)  TOTAL_MS ≈ 80 ms
-#   Conn 2+: DialAddrEarly (0-RTT – data in first packet flight)
-#            DialAddrEarly returns INSTANTLY; response arrives after 1 RTT.
-#            TOTAL_MS ≈ 40 ms per conn
-#   5-conn SUM ≈ 80 + 4×40 = 240 ms  (60% faster than TCP)
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "SCENARIO 6: Reconnection Burst  [delay 40ms – QUIC 0-RTT vs TCP 3-RTT per conn]"
 netem_apply "delay 40ms"

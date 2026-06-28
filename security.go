@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/hkdf"
 )
 
 var globalKeyLog io.WriteCloser
@@ -113,4 +115,60 @@ func DeriveRoomKey(roomName, password string) *RoomCrypto {
 	}
 	key := argon2.IDKey([]byte(password), []byte(roomName), 1, 64*1024, 4, 32)
 	return &RoomCrypto{roomKey: key}
+}
+
+// GenerateRoomSecret generates a random 32-byte secret used in room key derivation.
+// The secret is mixed into HKDF as a salt so that even knowing roomName+password,
+// an observer cannot derive the keys without the secret. The secret is rotated
+// whenever a peer is kicked or banned.
+func GenerateRoomSecret() []byte {
+	secret := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
+		panic(fmt.Sprintf("GenerateRoomSecret: %v", err))
+	}
+	return secret
+}
+
+// DeriveRoomKeys derives encryption and HMAC sub-keys from the room password
+// and room secret. The roomSecret is used as the HKDF salt — different secrets
+// produce different keys even with identical roomName+password.
+//
+// When password is empty the room name is used as key material. The AuthKey
+// matches the output of DeriveRoomKey for backward-compatible password comparison.
+// DeriveRoomKeys derives authKey from password (for access control), and EncKey/HMACKey
+// from the room secret (shared by all authenticated peers). This ensures all authenticated
+// peers can verify each other's E2EE messages, while the password gates room access.
+// Password is NOT used for E2EE key derivation — only for auth (who can join).
+func DeriveRoomKeys(roomName, password string, roomSecret []byte) *RoomKeys {
+	// AuthKey: derived from password (or roomName if no password) — for access control.
+	// Used by the server to verify a joining peer's password matches.
+	keyMaterial := password
+	if keyMaterial == "" {
+		keyMaterial = roomName
+	}
+	authKey := argon2.IDKey([]byte(keyMaterial), []byte(roomName), 1, 64*1024, 4, 32)
+
+	// EncKey and HMACKey: derived from roomSecret so all authenticated peers (who all
+	// receive the same secret) derive the SAME encryption and signing keys. This is the
+	// shared group key for E2EE. roomSecret must be non-nil for this to work.
+	var encKey, hmacKey []byte
+	if len(roomSecret) > 0 {
+		// Use roomSecret as HKDF salt to derive E2EE keys (per RFC 5869).
+		encReader := hkdf.New(sha256.New, authKey, roomSecret, []byte("p2p-messenger-enc"))
+		encKey = make([]byte, 32)
+		if _, err := io.ReadFull(encReader, encKey); err != nil {
+			panic(fmt.Sprintf("DeriveRoomKeys: hkdf enc: %v", err))
+		}
+		hmacReader := hkdf.New(sha256.New, authKey, roomSecret, []byte("p2p-messenger-hmac"))
+		hmacKey = make([]byte, 32)
+		if _, err := io.ReadFull(hmacReader, hmacKey); err != nil {
+			panic(fmt.Sprintf("DeriveRoomKeys: hkdf hmac: %v", err))
+		}
+	}
+
+	return &RoomKeys{
+		AuthKey: authKey,
+		EncKey:  encKey,
+		HMACKey: hmacKey,
+	}
 }
